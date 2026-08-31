@@ -146,8 +146,8 @@ body{margin:0;display:flex;justify-content:center}
 .sub .brand strong{color:#ea580c;font-weight:700}
 .sub a{color:inherit;text-decoration:none;cursor:pointer}
 .sub a:hover{opacity:.6}
-@media (max-width:480px){.widget{padding:20px 18px 18px}.row-main{gap:14px}.icon-triangle svg{width:44px;height:44px}.title{font-size:22px}.sub{font-size:15px}}
-@media (max-width:380px){.widget{padding:16px 14px 14px}.row-main{gap:12px;align-items:flex-start}.icon-triangle svg{width:36px;height:36px}.title{font-size:19px}.sub{font-size:14px}}
+@media (max-width:480px){.widget{padding:16px 14px 14px}.row-main{gap:12px}.icon-triangle svg{width:36px;height:36px}.title{font-size:19px}.sub{font-size:13px}}
+@media (max-width:380px){.widget{padding:14px 10px 12px}.row-main{gap:10px;align-items:flex-start}.icon-triangle svg{width:30px;height:30px}.title{font-size:17px}.sub{font-size:12px}}
 </style>
 <div class="widget">
   <div class="row-main">
