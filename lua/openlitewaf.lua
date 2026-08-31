@@ -151,13 +151,14 @@ body{margin:0;display:flex;justify-content:center}
 </style>
 <div class="widget">
   <div class="row-main">
-    <div class="icon-triangle" role="img" aria-label="警告三角">
-      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M12 2L1 21H23L12 2Z" stroke="#ea580c" stroke-width="2" stroke-linejoin="round" />
-        <path d="M12 9V14" stroke="#ea580c" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" />
-        <circle cx="12" cy="18" r="1.5" fill="#ea580c" />
-      </svg>
-    </div>
+      <div class="icon-triangle" role="img" aria-label="OpenLiteWaf">
+        <svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="1" y="1" width="62" height="62" rx="14" fill="#ea580c" />
+          <rect x="8" y="23" width="13" height="18" rx="6.5" stroke="#fff" stroke-width="3.2" />
+          <path d="M27 23v17h11" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M43 23l3 17 3.5-11 3.5 11 3-17" stroke="#fff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </div>
     <div class="text-group">
       <div class="title">{{TITLE}}</div>
       <div class="sub"><span class="brand">安全与性能由<strong>OpenLiteWaf</strong></span> 提供。被误封了？<a href="mailto:lyl518@outlook.com">联系管理员</a>。</div>
