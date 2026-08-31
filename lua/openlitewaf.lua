@@ -133,6 +133,7 @@ _M.RULES = {
 local WARN_HTML = [==[
 <style>
 *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+body{margin:0;display:flex;justify-content:center}
 .widget{max-width:560px;width:100%;padding:28px 28px 24px;background:#fff;border:1px solid rgba(226,232,240,.6);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
 .row-main{display:flex;align-items:center;gap:20px}
 .icon-triangle{flex-shrink:0;display:flex;align-items:center;justify-content:center;line-height:0}
