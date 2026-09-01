@@ -524,10 +524,6 @@ local STATS_HTML = [==[<!doctype html>
 body{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;max-width:860px;margin:2.25rem auto 3rem;padding:0 1.25rem;color:#23272e;background:#f5f6f8;-webkit-font-smoothing:antialiased}
 header{display:flex;align-items:flex-end;justify-content:space-between;gap:.8rem;flex-wrap:wrap;margin-bottom:1.6rem}
 h1{font-size:1.3rem;font-weight:700;margin:0;letter-spacing:.01em}
-.sub{margin:.35rem 0 0;font-size:.78rem;color:#8a919c}
-.live{display:inline-flex;align-items:center;gap:.45rem;font-size:.72rem;color:#66707c;background:#fff;border:1px solid #e6e8eb;border-radius:999px;padding:.3rem .8rem}
-.live i{width:7px;height:7px;border-radius:50%;background:#4caf6e;animation:olwpulse 2s ease-in-out infinite}
-@keyframes olwpulse{0%,100%{opacity:1}50%{opacity:.3}}
 .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:.8rem}
 .card{background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:.9rem 1.05rem .85rem;box-shadow:0 1px 2px rgba(16,24,40,.04)}
 .card span{display:block;font-size:.72rem;color:#8a919c;letter-spacing:.02em}
@@ -569,9 +565,7 @@ footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1
 <header>
   <div>
     <h1>OpenLiteWaf 安全统计</h1>
-    <p class="sub">边缘 WAF 拦截态势 · 计数保存在内存中，进程重启后清零</p>
   </div>
-  <span class="live"><i></i>每 30 秒自动刷新</span>
 </header>
 
 <div class="cards">
