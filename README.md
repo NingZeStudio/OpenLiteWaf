@@ -1,6 +1,6 @@
 # OpenLiteWaf
 
-运行在 nginx 容器内的 OpenResty Lua WAF。在反向代理层对请求做 CC 限速与攻击特征检查，并维护一个公开的统计页。它工作在 nginx access 阶段，所有状态保存在 `lua_shared_dict` 中，不写盘，进程重启后清零。许可证：MIT。
+运行在 nginx 容器内的 OpenResty Lua WAF。在反向代理层对请求做 CC 限速与攻击特征检查，并维护一个公开的统计页。它工作在 nginx access 阶段，所有状态保存在 `lua_shared_dict` 中，并定时快照到挂载目录实现持久化（进程重启自动恢复，最多丢失最近一个快照间隔的数据；目录不可写时退化为内存模式）。许可证：MIT。
 
 代码结构：
 
@@ -36,6 +36,8 @@ OpenLiteWaf/
 
 数据以环形槽位保存在 shared dict：攻击日志 500 条、封禁槽位 1024 个，写满后覆盖最旧记录。shared dict 不支持枚举键，`banned_active` 通过遍历封禁槽位统计未到期数量得出，同一 IP 重复封禁会覆盖槽位，结果可能低估。
 
+持久化：worker 0 每 60 秒将计数、趋势分钟桶、攻击日志环形缓冲与未到期封禁名单（含封禁 IP 登记环 `br:*`）写为 `/data/openlitewaf/snapshot.json`（临时文件 + rename 原子替换），`init_by_lua` 阶段恢复；封禁按剩余 TTL 重建。快照间隔内的数据变更在进程崩溃时丢失。`/data/openlitewaf` 须以读写挂载，目录不可写时退化为内存模式。
+
 ## 部署
 
 nginx 服务使用 OpenResty 镜像（当前适配 `openresty/openresty:1.27.1.2-alpine`），相关挂载：
@@ -45,6 +47,7 @@ volumes:
   - ./nginx:/etc/nginx/conf.d:ro                                    # 站点配置
   - ../OpenLiteWaf/nginx/nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
   - ../OpenLiteWaf/lua:/usr/local/openresty/nginx/lua:ro
+  - ../OpenLiteWaf/data:/data/openlitewaf                           # 快照持久化目录（读写）
 ```
 
 站点配置的 80 与 443 两个 server 都需要 `access_by_lua_file`，443 另有三个统计 location：

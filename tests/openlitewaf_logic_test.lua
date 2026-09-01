@@ -92,6 +92,7 @@ ngx = {
     },
     shared = { openlitewaf = newdict() },
     var = {},
+    ctx = {},
     header = {},
     status = nil,
     HTTP_OK = 200,
@@ -101,29 +102,108 @@ ngx = {
     exit = function(code) EXITED = code; error({ exit = code }) end,
 }
 
--- cjson.safe stub：encode 平铺/一层嵌套（足够统计页 JSON）；
--- decode 按本模块序列化格式做简易键值提取（日志条目均为一层平铺）
-package.loaded["cjson.safe"] = {
-    encode = function(v)
-        if type(v) ~= "table" then return tostring(v) end
+-- cjson.safe stub：完整实现测试所需的 JSON 编解码（快照含嵌套表/数组）。
+-- 编码：数字取整（与真实 cjson 数值语义兼容）、字符串转义、数组/对象递归。
+-- 解码：递归下降，支持对象/数组/字符串转义/数字/布尔/null。
+local function json_enc(v)
+    local t = type(v)
+    if v == nil then return "null" end
+    if t == "boolean" then return tostring(v) end
+    if t == "number" then
+        if v == math.floor(v) and math.abs(v) < 2 ^ 53 then
+            return string.format("%d", v)
+        end
+        return tostring(v)
+    end
+    if t == "string" then
+        return '"' .. v:gsub('[%c"\\]', function(c)
+            if c == '"' then return '\\"' end
+            if c == "\\" then return "\\\\" end
+            if c == "\n" then return "\\n" end
+            if c == "\r" then return "\\r" end
+            if c == "\t" then return "\\t" end
+            return string.format("\\u%04x", c:byte())
+        end) .. '"'
+    end
+    if t == "table" then
+        if #v > 0 then
+            local parts = {}
+            for i = 1, #v do parts[i] = json_enc(v[i]) end
+            return "[" .. table.concat(parts, ",") .. "]"
+        end
         local parts = {}
         for k, val in pairs(v) do
-            local out
-            if type(val) == "table" then out = package.loaded["cjson.safe"].encode(val)
-            elseif type(val) == "number" then out = string.format("%.0f", val)
-            else out = string.format('"%s"', tostring(val)) end
-            parts[#parts + 1] = string.format('"%s":%s', k, out)
+            parts[#parts + 1] = json_enc(tostring(k)) .. ":" .. json_enc(val)
         end
         return "{" .. table.concat(parts, ",") .. "}"
-    end,
-    decode = function(s)
-        local out = {}
-        for k, v in s:gmatch('"([%w_]+)"%s*:%s*"?([^",{}]-)"?[,}%]]') do
-            -- 与真实 cjson 语义一致：数字键值转 number
-            out[k] = tonumber(v) or v
+    end
+    error("cannot encode " .. t)
+end
+
+local function json_dec(s, i)
+    i = i or 1
+    local c = s:sub(i, i)
+    while c == " " or c == "," or c == ":" or c == "\n" or c == "\r" or c == "\t" do
+        i = i + 1
+        c = s:sub(i, i)
+    end
+    if c == "{" then
+        local obj = {}
+        i = i + 1
+        while true do
+            c = s:sub(i, i)
+            if c == "}" then return obj, i + 1 end
+            local k
+            k, i = json_dec(s, i)
+            local v
+            v, i = json_dec(s, i)  -- 跳过 ':' 由开头的空白/符号过滤处理
+            obj[k] = v
         end
-        return out
-    end,
+    elseif c == "[" then
+        local arr = {}
+        i = i + 1
+        while true do
+            c = s:sub(i, i)
+            if c == "]" then return arr, i + 1 end
+            local v
+            v, i = json_dec(s, i)
+            arr[#arr + 1] = v
+        end
+    elseif c == '"' then
+        local out = {}
+        i = i + 1
+        while true do
+            local ch = s:sub(i, i)
+            if ch == "\\" then
+                local n = s:sub(i + 1, i + 1)
+                if n == "n" then out[#out + 1] = "\n"
+                elseif n == "r" then out[#out + 1] = "\r"
+                elseif n == "t" then out[#out + 1] = "\t"
+                elseif n == "u" then
+                    out[#out + 1] = string.char(tonumber(s:sub(i + 2, i + 5), 16) or 63)
+                    i = i + 4
+                else out[#out + 1] = n end
+                i = i + 2
+            elseif ch == '"' then
+                return table.concat(out), i + 1
+            else
+                out[#out + 1] = ch
+                i = i + 1
+            end
+        end
+    else
+        local num = s:match("^%-?%d+%.?%d*[eE]?[-+]?%d*", i)
+        if num then return tonumber(num), i + #num end
+        if s:sub(i, i + 3) == "true" then return true, i + 4 end
+        if s:sub(i, i + 4) == "false" then return false, i + 5 end
+        if s:sub(i, i + 3) == "null" then return nil, i + 4 end
+        error("bad json at " .. i)
+    end
+end
+
+package.loaded["cjson.safe"] = {
+    encode = json_enc,
+    decode = function(s) local ok, v, i = pcall(json_dec, s) if ok and i and v ~= nil then return v end return nil end,
 }
 
 local waf = dofile(LUA_PATH)
@@ -418,6 +498,33 @@ do
     ngx.re.compile = function(_, flags)
         return { find = function(_, s) return hit(s) end }, nil
     end
+end
+
+-- T25 快照持久化：计数 / 攻击日志 / 封禁名单的保存与恢复（真实文件 IO，临时目录）
+do
+    local dir = "/data/data/com.termux/files/usr/tmp/wafdbg/snaptest"
+    os.execute("mkdir -p " .. dir)
+    os.remove(dir .. "/snapshot.json")
+    local w1 = fresh()
+    w1.CONFIG.data_dir = dir
+    request({ uri = "/?id=1 UNION", hit = true, ip = "30.1.1.1" })
+    local seq_before = ngx.shared.openlitewaf:get("log_seq")
+    ok(w1._save(ngx.shared.openlitewaf) == true, "T25 快照写入成功")
+    -- 新 dict + 新模块：模拟进程重启后的 init 恢复
+    ngx.shared.openlitewaf = newdict()
+    local w2 = dofile(LUA_PATH)
+    w2.CONFIG.data_dir = dir
+    w2.init()
+    local d2 = ngx.shared.openlitewaf
+    ok(counter(d2, "total") == 1, "T25 计数器恢复")
+    ok(counter(d2, "sqli") == 1, "T25 类目计数恢复")
+    ok(d2:get("b:30.1.1.1") ~= nil, "T25 封禁名单恢复")
+    ok(d2:get("log_seq") == seq_before, "T25 攻击日志序列恢复")
+    -- 恢复后的封禁仍然生效（封禁期内拦截、不重复计类目）
+    local r25 = request({ uri = "/v1/log", ip = "30.1.1.1" })
+    ok(r25.blocked, "T25 恢复的封禁仍拦截")
+    ok(counter(d2, "sqli") == 1, "T25 恢复后封禁期不重复计类目")
+    os.remove(dir .. "/snapshot.json")
 end
 
 print(fail == 0 and "全部通过" or (fail .. " 项失败"))

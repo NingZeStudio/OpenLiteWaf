@@ -5,7 +5,7 @@
 -- 当前封禁 IP 近似计数。
 -- 文档与集成方式见 OpenLiteWaf/README.md。
 
-local _M = { _VERSION = "1.1.0" }
+local _M = { _VERSION = "1.2.0" }
 
 local cjson = require "cjson.safe"
 
@@ -37,6 +37,11 @@ local CONFIG = {
     -- 封禁槽位数：shared dict 无法枚举键，用环形槽位记录封禁到期时间，
     -- 活跃封禁 IP 数为近似值（槽位被同 IP 重复封禁覆盖时可能低估）
     ban_slots = 1024,
+    -- 快照持久化：worker 0 每 snapshot_interval 秒写快照到 data_dir，
+    -- init_by_lua 恢复（计数 / 趋势 / 攻击日志 / 封禁名单）。
+    -- 目录不可写时自动退化为纯内存模式，只影响持久化不影响防护。
+    data_dir = "/data/openlitewaf",
+    snapshot_interval = 60,
     -- 请求体扫描：只读前 body_scan_limit 字节（payload 几乎总在开头）；
     -- Content-Length 超过 body_size_limit 的请求直接跳过（大文件上传）
     body_scan_limit = 65536,
@@ -48,6 +53,7 @@ local CONFIG = {
     -- 攻击日志单字段（URI / UA）最大长度
     log_field_max = 160,
 }
+_M.CONFIG = CONFIG  -- 导出供回归测试覆盖（如 data_dir）
 
 -- ─────────── 攻击特征规则（PCRE，语法同 ngx.re）───────────
 -- 按顺序匹配，命中即停。类目：sqli / xss / traversal / rce / probe。
@@ -306,10 +312,13 @@ local function bump_trend(d)
     end
 end
 
--- 记录一次新封禁的到期时间（活跃封禁数的近似数据源）
+-- 记录一次新封禁的到期时间（活跃封禁数的近似数据源）。
+-- br:* 与 bs:* 同槽位记录封禁 IP，供快照恢复 b:<ip> 封禁名单
 local function record_ban_slot(d, ttl)
     local seq = d:incr("ban_seq", 1, 0) or 0
-    d:set("bs:" .. (seq - 1) % CONFIG.ban_slots, ngx.now() + ttl)
+    local slot = (seq - 1) % CONFIG.ban_slots
+    d:set("bs:" .. slot, ngx.now() + ttl, ttl)
+    d:set("br:" .. slot, ngx.var.remote_addr or "unknown", ttl)
     bump(d, "banned")
 end
 
@@ -411,6 +420,7 @@ local function read_body_data(uri)
 end
 
 local function deny(d, category)
+    ngx.ctx.olw_blocked = true  -- 供 OpenLiteStats log 阶段排除被拦截请求
     bump(d, "blocked")
     if category then
         bump(d, category)
@@ -438,16 +448,125 @@ local function deny(d, category)
     return ngx.exit(ngx.HTTP_OK)
 end
 
--- ───────────────────── 生命周期 ─────────────────────
--- init_by_lua：master 进程初始化，仅记录启动时间（shared dict 全 worker 共享）。
+-- ──────────────────── 生命周期 ─────────────────────
+-- init_by_lua：master 进程初始化。先恢复快照（若存在），再记录启动时间
+-- （shared dict 全 worker 共享，master 阶段写入无 worker 竞态）。
 -- 规则编译保持惰性（首个请求时按 worker 完成）：ngx.re.compile 依赖 resty.core.re，
 -- 模块顶部已 pcall 加载；即便加载失败，get_rules() 也会走纯字符串匹配路径，
 -- 不会因 compile 缺失而中止 access 阶段（历史 bug：曾导致线上完全不拦截）。
+
+-- 持久化键集合：直接映射 c:<name> 计数器
+local PERSIST_COUNTERS = { "total", "blocked", "banned", "cc", "sqli", "xss", "traversal", "rce", "probe" }
+
+local function snapshot_path()
+    return CONFIG.data_dir .. "/snapshot.json"
+end
+
 function _M.init()
     local d = dict()
-    if d and not d:get("c:start_epoch") then
+    if not d then return end
+
+    -- 快照恢复（文件缺失 / 目录不可写 / JSON 损坏时跳过，退化为内存模式）
+    local f = io.open(snapshot_path(), "rb")
+    if f then
+        local raw = f:read("*a")
+        f:close()
+        local ok, snap = pcall(cjson.decode, raw)
+        if ok and type(snap) == "table" then
+            for _, name in ipairs(PERSIST_COUNTERS) do
+                d:set("c:" .. name, (snap.counters and snap.counters[name]) or 0)
+            end
+            if snap.start_epoch then d:set("c:start_epoch", snap.start_epoch) end
+            if snap.ban_seq then d:set("ban_seq", snap.ban_seq) end
+            if snap.log_seq then d:set("log_seq", snap.log_seq) end
+            local now = ngx.now()
+            -- 封禁恢复：未到期的槽位连同封禁名单 b:<ip> 一并重建
+            for _, e in ipairs(snap.bans or {}) do
+                local remaining = (e.exp or 0) - now
+                if remaining > 0 and e.ip then
+                    d:set("bs:" .. e.slot, e.exp, math.ceil(remaining))
+                    d:set("br:" .. e.slot, e.ip, math.ceil(remaining))
+                    d:set("b:" .. e.ip, 1, math.ceil(remaining))
+                end
+            end
+            -- 趋势分钟桶恢复（键 TTL 重新计时，误差不超过快照间隔）
+            for _, e in ipairs(snap.trends or {}) do
+                local key = "m:" .. e.bucket
+                d:set(key, e.n or 0)
+                d:expire(key, CONFIG.trend_minutes * 120)
+            end
+            -- 攻击日志环形缓冲恢复
+            for _, e in ipairs(snap.logs or {}) do
+                d:set("log:" .. e.i, e.s)
+            end
+        end
+    end
+
+    if not d:get("c:start_epoch") then
         d:set("c:start_epoch", ngx.now())
     end
+end
+
+-- 写快照（worker 0 定时调用；下划线后缀供回归测试直接触发）
+function _M._save(d)
+    local counters = {}
+    for _, name in ipairs(PERSIST_COUNTERS) do
+        counters[name] = d:get("c:" .. name) or 0
+    end
+    local now = ngx.now()
+    local bans = {}
+    for slot = 0, CONFIG.ban_slots - 1 do
+        local exp = d:get("bs:" .. slot)
+        local ip = d:get("br:" .. slot)
+        if exp and exp > now and ip then
+            bans[#bans + 1] = { slot = slot, exp = exp, ip = ip }
+        end
+    end
+    local trends = {}
+    for i = 0, CONFIG.trend_minutes * 2 + 10 do
+        local bucket = math.floor(now / 60) - i
+        local n = d:get("m:" .. bucket)
+        if n and n > 0 then trends[#trends + 1] = { bucket = bucket, n = n } end
+    end
+    local log_seq = d:get("log_seq") or 0
+    local log_total = math.min(log_seq, CONFIG.log_capacity)
+    local logs = {}
+    for i = 0, log_total - 1 do
+        local slot = (log_seq - i - 1) % CONFIG.log_capacity
+        local raw = d:get("log:" .. slot)
+        if raw then logs[#logs + 1] = { i = slot, s = raw } end
+    end
+    local snap = {
+        version = _M._VERSION,
+        saved_at = math.floor(now),
+        start_epoch = d:get("c:start_epoch"),
+        counters = counters,
+        ban_seq = d:get("ban_seq") or 0,
+        bans = bans,
+        trends = trends,
+        log_seq = log_seq,
+        logs = logs,
+    }
+    local ok, json = pcall(cjson.encode, snap)
+    if not ok or not json then return false end
+    local tmp = snapshot_path() .. ".tmp"
+    local f = io.open(tmp, "wb")
+    if not f then return false end
+    f:write(json)
+    f:close()
+    local renamed = os.rename(tmp, snapshot_path())
+    if renamed then d:set("snap_at", math.floor(now)) end
+    return renamed
+end
+
+-- init_worker_by_lua：仅 worker 0 启动定时快照
+function _M.timer()
+    if ngx.worker.id() ~= 0 then return end
+    ngx.timer.every(CONFIG.snapshot_interval, function(premature)
+        if premature then return end
+        local d = dict()
+        if d then pcall(_M._save, d) end
+    end)
 end
 
 -- access_by_lua：每个请求的检查入口
