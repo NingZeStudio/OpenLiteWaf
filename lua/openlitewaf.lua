@@ -528,7 +528,7 @@ h1{font-size:1.3rem;font-weight:700;margin:0;letter-spacing:.01em}
 .live{display:inline-flex;align-items:center;gap:.45rem;font-size:.72rem;color:#66707c;background:#fff;border:1px solid #e6e8eb;border-radius:999px;padding:.3rem .8rem}
 .live i{width:7px;height:7px;border-radius:50%;background:#4caf6e;animation:olwpulse 2s ease-in-out infinite}
 @keyframes olwpulse{0%,100%{opacity:1}50%{opacity:.3}}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem}
+.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:.8rem}
 .card{background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:.9rem 1.05rem .85rem;box-shadow:0 1px 2px rgba(16,24,40,.04)}
 .card span{display:block;font-size:.72rem;color:#8a919c;letter-spacing:.02em}
 .card b{display:block;margin-top:.35rem;font-size:1.45rem;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em;color:#b42318}
@@ -562,6 +562,7 @@ footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1
 .noscript{color:#b42318;font-size:.85rem}
 .empty{color:#a3aab3;font-size:.82rem;padding:1.2rem 0;text-align:center}
 @media (max-width:520px){body{margin-top:1.25rem;padding:0 .9rem}h1{font-size:1.1rem}.card b{font-size:1.25rem}th,td{padding:.45rem .6rem}}
+@media (min-width:640px){.cards{grid-template-columns:repeat(3,1fr)}}
 </style>
 </head>
 <body>
@@ -576,6 +577,7 @@ footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1
 <div class="cards">
   <div class="card muted"><span>累计请求</span><b id="st-req">–</b></div>
   <div class="card"><span>已拦截请求</span><b id="st-blocked">–</b></div>
+  <div class="card"><span>拦截率</span><b id="st-ratio">–</b></div>
   <div class="card"><span>最近 60 分钟拦截</span><b id="st-60m">–</b></div>
   <div class="card"><span>拦截速率（次/分钟）</span><b id="st-rate">–</b></div>
   <div class="card muted"><span>当前封禁 IP（近似）</span><b id="st-active">–</b></div>
@@ -603,7 +605,7 @@ footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1
   <button id="pg-next">下一页</button>
 </div>
 
-<footer id="foot">计数保存在内存中，进程重启后清零 · 数据每 30 秒自动刷新</footer>
+<footer id="foot">OpenLiteWaf</footer>
 
 <noscript><p class="noscript">此页面需要启用 JavaScript 才能展示统计数据。</p></noscript>
 
@@ -682,11 +684,12 @@ function fetchStats(){
   fetch("/security/stats").then(function(r){return r.json();}).then(function(j){
     setText("st-req",j.requests_total);
     setText("st-blocked",j.blocked_total);
+    setText("st-ratio",j.requests_total>0?(j.blocked_total/j.requests_total*100).toFixed(1)+"%":"–");
     var m60=j.blocked_60m||0;
     setText("st-60m",m60);
     setText("st-rate",(m60/60).toFixed(1));
     setText("st-active",j.banned_active);
-    el("foot").textContent="OpenLiteWaf v"+j.version+" · 运行 "+j.uptime_seconds+" 秒 · 日志缓存 "+j.logs_total+" 条 · 计数保存在内存中，进程重启后清零";
+    el("foot").textContent="OpenLiteWaf v"+j.version+" · 运行 "+j.uptime_seconds+" 秒";
     drawTrend(j.trends);
     drawCats(j.blocked||{});
     drawTopIps(j.top_ips);
