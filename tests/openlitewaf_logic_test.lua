@@ -253,8 +253,10 @@ ok(not r.blocked, "封禁不影响其他 IP")
 local js = stats_json(waf, "/security/stats")
 ok(js and js:find('"blocked_total"', 1, true) ~= nil, "JSON 统计页输出成功")
 ok(js and js:find('"blocked_total"', 1, true) ~= nil and js:find('"trends"', 1, true) ~= nil
-    and js:find('"banned_active"', 1, true) ~= nil and js:find('"top_ips"', 1, true) ~= nil,
-    "JSON 含新增字段（trends/banned_active/top_ips）")
+    and js:find('"banned_active"', 1, true) ~= nil and js:find('"top_ips"', 1, true) ~= nil
+    and js:find('"blocked_60m"', 1, true) ~= nil,
+    "JSON 含新增字段（trends/banned_active/top_ips/blocked_60m）")
+ok(js and js:find('"banned_total"', 1, true) == nil, "JSON 不再输出累计封禁次数")
 
 -- T12 统计页 HTML
 js = stats_json(waf, "/security")
@@ -370,7 +372,7 @@ do
     request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.1" })
     js = stats_json(w, "/security/stats")
     ok(js and js:find('"banned_active":1', 1, true) ~= nil, "活跃封禁数为 1")
-    ok(js and js:find('"banned_total":1', 1, true) ~= nil, "累计封禁次数为 1")
+    ok(js and js:find('"banned_total"', 1, true) == nil, "封禁发生不产生累计封禁次数指标")
     -- 再封 2 个
     request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.2" })
     request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.3" })
@@ -389,6 +391,7 @@ do
     ok(ngx.shared.openlitewaf:get("m:" .. math.floor(NOW / 60)) == 1, "分钟桶计数写入")
     js = stats_json(w, "/security/stats")
     ok(js and js:find('"trends"', 1, true) ~= nil, "stats 含趋势数组")
+    ok(js and js:find('"blocked_60m":1', 1, true) ~= nil, "最近 60 分钟拦截数等于分钟桶之和")
 end
 
 -- T23 top_ips 聚合（注意：同 IP 首次攻击即被封禁，后续请求不再产生攻击日志，

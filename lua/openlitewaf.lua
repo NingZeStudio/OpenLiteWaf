@@ -551,8 +551,9 @@ footer{color:#9ca3af;font-size:.75rem;margin-top:1.5rem;line-height:1.6}
 <div class="cards">
   <div class="card muted"><b id="st-req">–</b><span>累计请求</span></div>
   <div class="card"><b id="st-blocked">–</b><span>已拦截请求</span></div>
-  <div class="card"><b id="st-active">–</b><span>当前封禁 IP（近似）</span></div>
-  <div class="card muted"><b id="st-bantotal">–</b><span>累计封禁次数</span></div>
+  <div class="card"><b id="st-60m">–</b><span>最近 60 分钟拦截</span></div>
+  <div class="card"><b id="st-rate">–</b><span>拦截速率（次/分钟）</span></div>
+  <div class="card muted"><b id="st-active">–</b><span>当前封禁 IP（近似）</span></div>
 </div>
 
 <h2>最近 60 分钟拦截趋势</h2>
@@ -649,8 +650,10 @@ function fetchStats(){
   fetch("/security/stats").then(function(r){return r.json();}).then(function(j){
     setText("st-req",j.requests_total);
     setText("st-blocked",j.blocked_total);
+    var m60=j.blocked_60m||0;
+    setText("st-60m",m60);
+    setText("st-rate",(m60/60).toFixed(1));
     setText("st-active",j.banned_active);
-    setText("st-bantotal",j.banned_total);
     el("foot").textContent="OpenLiteWaf v"+j.version+" · 运行 "+j.uptime_seconds+" 秒 · 日志缓存 "+j.logs_total+" 条 · 计数保存在内存中，进程重启后清零 · 数据每 30 秒自动刷新";
     drawTrend(j.trends);
     drawCats(j.blocked||{});
@@ -703,9 +706,14 @@ local function build_stats(d)
     local function c(name) return (d and d:get("c:" .. name)) or 0 end
 
     local trends = {}
+    -- 最近 60 分钟拦截数：趋势分钟桶之和（口径与趋势图一致，
+    -- 不含封禁期内被拦截但无类目的请求）
+    local blocked_60m = 0
     for i = CONFIG.trend_minutes - 1, 0, -1 do
         local bucket = math.floor(now / 60) - i
-        trends[#trends + 1] = { t = bucket * 60, n = (d and d:get("m:" .. bucket)) or 0 }
+        local n = (d and d:get("m:" .. bucket)) or 0
+        trends[#trends + 1] = { t = bucket * 60, n = n }
+        blocked_60m = blocked_60m + n
     end
 
     return {
@@ -714,7 +722,7 @@ local function build_stats(d)
         uptime_seconds = math.floor(now - started),
         requests_total = c("total"),
         blocked_total = c("blocked"),
-        banned_total = c("banned"),
+        blocked_60m = blocked_60m,
         banned_active = d and count_active_bans(d) or 0,
         logs_total = d and math.min(d:get("log_seq") or 0, CONFIG.log_capacity) or 0,
         blocked = {

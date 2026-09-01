@@ -28,7 +28,7 @@ OpenLiteWaf/
 
 `GET /security` 返回 HTML 页面，由内联 JS 渲染并每 30 秒轮询刷新，需要浏览器启用 JavaScript。数据接口有两个 JSON 端点：
 
-`GET /security/stats` 返回汇总：累计请求与拦截数（`requests_total`、`blocked_total`）、按类目分布（`blocked`，含 `cc`、`sqli`、`xss`、`traversal`、`rce`、`probe`）、累计封禁次数（`banned_total`）、当前封禁 IP 数（`banned_active`）、缓存日志条数（`logs_total`）、最近 60 分钟逐分钟拦截数（`trends`）与来源 IP Top（`top_ips`，按最近日志聚合）。
+`GET /security/stats` 返回汇总：累计请求与拦截数（`requests_total`、`blocked_total`）、最近 60 分钟拦截数（`blocked_60m`，为 `trends` 各分钟桶之和，不含封禁期内无类目的拦截）、按类目分布（`blocked`，含 `cc`、`sqli`、`xss`、`traversal`、`rce`、`probe`）、当前封禁 IP 数（`banned_active`）、缓存日志条数（`logs_total`）、最近 60 分钟逐分钟拦截数（`trends`）与来源 IP Top（`top_ips`，按最近日志聚合）。
 
 `GET /security/logs?page=N` 返回攻击日志分页，每页 50 条，最新在前，页码越界时收敛到边界页。每条记录包含时间（`t`）、类目（`cat`）、脱敏 IP（`ip`）、URI（`u`）与 User-Agent（`a`）。
 
