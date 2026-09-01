@@ -520,40 +520,65 @@ local STATS_HTML = [==[<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>OpenLiteWaf 安全统计</title>
 <style>
-body{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;max-width:720px;margin:2.5rem auto;padding:0 1rem;color:#1f2937;background:#fafafa}
-h1{font-size:1.25rem;margin:0 0 1.2rem}
-h2{font-size:.95rem;color:#374151;margin:1.8rem 0 .7rem}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.75rem}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:.9rem 1rem}
-.card b{display:block;font-size:1.35rem;font-variant-numeric:tabular-nums;color:#b91c1c}
-.card.muted b{color:#374151}
-.card span{font-size:.75rem;color:#6b7280}
-.panel{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:.9rem 1rem}
-table{border-collapse:collapse;width:100%;background:#fff;border:1px solid #e5e7eb}
-th,td{padding:.45rem .6rem;text-align:left;border-bottom:1px solid #f3f4f6;font-size:.8rem;word-break:break-all}
-th{color:#6b7280;font-weight:600;background:#f9fafb}
-td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
-.tag{display:inline-block;padding:.05rem .4rem;border-radius:3px;font-size:.72rem;background:#fef2f2;color:#b91c1c;border:1px solid #fecaca}
-.bar{height:14px;background:#dc2626;opacity:.75;border-radius:2px;min-width:2px}
-.barrow{display:flex;align-items:center;gap:.6rem;margin:.35rem 0;font-size:.8rem}
-.barrow .lbl{width:7em;color:#374151;flex-shrink:0}
-.barrow .track{flex:1;background:#f3f4f6;border-radius:2px}
-.pager{display:flex;gap:.6rem;align-items:center;justify-content:center;margin:.8rem 0}
-.pager button{font:inherit;font-size:.8rem;padding:.25rem .8rem;border:1px solid #d1d5db;background:#fff;border-radius:4px;color:#374151;cursor:pointer}
-.pager button:disabled{color:#d1d5db;cursor:default}
-footer{color:#9ca3af;font-size:.75rem;margin-top:1.5rem;line-height:1.6}
-.empty{color:#9ca3af;font-size:.85rem;padding:1rem 0;text-align:center}
+*{box-sizing:border-box}
+body{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;max-width:860px;margin:2.25rem auto 3rem;padding:0 1.25rem;color:#23272e;background:#f5f6f8;-webkit-font-smoothing:antialiased}
+header{display:flex;align-items:flex-end;justify-content:space-between;gap:.8rem;flex-wrap:wrap;margin-bottom:1.6rem}
+h1{font-size:1.3rem;font-weight:700;margin:0;letter-spacing:.01em}
+.sub{margin:.35rem 0 0;font-size:.78rem;color:#8a919c}
+.live{display:inline-flex;align-items:center;gap:.45rem;font-size:.72rem;color:#66707c;background:#fff;border:1px solid #e6e8eb;border-radius:999px;padding:.3rem .8rem}
+.live i{width:7px;height:7px;border-radius:50%;background:#4caf6e;animation:olwpulse 2s ease-in-out infinite}
+@keyframes olwpulse{0%,100%{opacity:1}50%{opacity:.3}}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.8rem}
+.card{background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:.9rem 1.05rem .85rem;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+.card span{display:block;font-size:.72rem;color:#8a919c;letter-spacing:.02em}
+.card b{display:block;margin-top:.35rem;font-size:1.45rem;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em;color:#b42318}
+.card.muted b{color:#23272e}
+h2{display:flex;align-items:center;gap:.7rem;font-size:.8rem;font-weight:600;color:#66707c;margin:2.1rem 0 .75rem;letter-spacing:.04em}
+h2::after{content:"";flex:1;height:1px;background:#e6e8eb}
+h2 small{font-weight:400;font-size:.72rem;color:#98a1ab;letter-spacing:0}
+.panel{background:#fff;border:1px solid #e6e8eb;border-radius:10px;padding:1.05rem 1.1rem;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+#trend rect{transition:opacity .15s}
+#trend rect:hover{opacity:1}
+.barrow{display:flex;align-items:center;gap:.8rem;margin:.55rem 0;font-size:.78rem}
+.barrow .lbl{width:8em;color:#3f4750;flex-shrink:0}
+.barrow .lbl.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.barrow .track{flex:1;height:8px;background:#f0f2f4;border-radius:999px;overflow:hidden}
+.bar{display:block;height:100%;background:#d64545;border-radius:999px;min-width:2px}
+.barrow .num{min-width:3.5em;text-align:right;font-variant-numeric:tabular-nums;color:#23272e}
+.tablewrap{background:#fff;border:1px solid #e6e8eb;border-radius:10px;box-shadow:0 1px 2px rgba(16,24,40,.04);overflow:hidden}
+table{border-collapse:collapse;width:100%}
+th,td{padding:.5rem .8rem;text-align:left;border-bottom:1px solid #f1f3f5;font-size:.78rem;word-break:break-all;vertical-align:top}
+th{color:#8a919c;font-weight:600;font-size:.72rem;background:#fafbfc;letter-spacing:.03em}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafbfc}
+td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;color:#66707c}
+.tag{display:inline-block;padding:.08rem .5rem;border-radius:999px;font-size:.7rem;background:#fdf1f0;color:#b42318;border:1px solid #f2cdca}
+.pager{display:flex;gap:.7rem;align-items:center;justify-content:center;margin:.9rem 0}
+.pager button{font:inherit;font-size:.78rem;padding:.3rem .95rem;border:1px solid #d5d9de;background:#fff;border-radius:999px;color:#3f4750;cursor:pointer;transition:border-color .15s,background .15s}
+.pager button:hover:not(:disabled){border-color:#b6bcc4;background:#fafbfc}
+.pager button:disabled{color:#c3c9d0;border-color:#e6e8eb;cursor:default}
+.pager .info{font-size:.74rem;color:#8a919c}
+footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1ab;font-size:.73rem;line-height:1.7}
+.noscript{color:#b42318;font-size:.85rem}
+.empty{color:#a3aab3;font-size:.82rem;padding:1.2rem 0;text-align:center}
+@media (max-width:520px){body{margin-top:1.25rem;padding:0 .9rem}h1{font-size:1.1rem}.card b{font-size:1.25rem}th,td{padding:.45rem .6rem}}
 </style>
 </head>
 <body>
-<h1>OpenLiteWaf 安全统计</h1>
+<header>
+  <div>
+    <h1>OpenLiteWaf 安全统计</h1>
+    <p class="sub">边缘 WAF 拦截态势 · 计数保存在内存中，进程重启后清零</p>
+  </div>
+  <span class="live"><i></i>每 30 秒自动刷新</span>
+</header>
 
 <div class="cards">
-  <div class="card muted"><b id="st-req">–</b><span>累计请求</span></div>
-  <div class="card"><b id="st-blocked">–</b><span>已拦截请求</span></div>
-  <div class="card"><b id="st-60m">–</b><span>最近 60 分钟拦截</span></div>
-  <div class="card"><b id="st-rate">–</b><span>拦截速率（次/分钟）</span></div>
-  <div class="card muted"><b id="st-active">–</b><span>当前封禁 IP（近似）</span></div>
+  <div class="card muted"><span>累计请求</span><b id="st-req">–</b></div>
+  <div class="card"><span>已拦截请求</span><b id="st-blocked">–</b></div>
+  <div class="card"><span>最近 60 分钟拦截</span><b id="st-60m">–</b></div>
+  <div class="card"><span>拦截速率（次/分钟）</span><b id="st-rate">–</b></div>
+  <div class="card muted"><span>当前封禁 IP（近似）</span><b id="st-active">–</b></div>
 </div>
 
 <h2>最近 60 分钟拦截趋势</h2>
@@ -562,23 +587,25 @@ footer{color:#9ca3af;font-size:.75rem;margin-top:1.5rem;line-height:1.6}
 <h2>拦截类别分布</h2>
 <div class="panel" id="cats"><div class="empty">加载中…</div></div>
 
-<h2>攻击来源 IP Top（最近 500 条，已脱敏）</h2>
+<h2>攻击来源 IP Top <small>最近 500 条 · 已脱敏</small></h2>
 <div class="panel" id="topips"><div class="empty">加载中…</div></div>
 
-<h2>攻击日志（最近 500 条，每页 50 条）</h2>
+<h2>攻击日志 <small>最近 500 条 · 每页 50 条</small></h2>
+<div class="tablewrap">
 <table>
 <thead><tr><th>时间</th><th>类目</th><th>来源 IP</th><th>URI</th><th>User-Agent</th></tr></thead>
 <tbody id="logrows"></tbody>
 </table>
+</div>
 <div class="pager">
   <button id="pg-prev">上一页</button>
-  <span id="pg-info" style="font-size:.8rem;color:#6b7280">–</span>
+  <span id="pg-info" class="info">–</span>
   <button id="pg-next">下一页</button>
 </div>
 
-<footer id="foot">OpenLiteWaf · 计数保存在内存中，进程重启后清零 · 数据每 30 秒自动刷新</footer>
+<footer id="foot">计数保存在内存中，进程重启后清零 · 数据每 30 秒自动刷新</footer>
 
-<noscript><p style="color:#b91c1c">此页面需要启用 JavaScript 才能展示统计数据。</p></noscript>
+<noscript><p class="noscript">此页面需要启用 JavaScript 才能展示统计数据。</p></noscript>
 
 <script>
 var CATS={cc:"CC 频率超限",sqli:"SQL 注入",xss:"XSS",traversal:"路径穿越",rce:"命令执行",probe:"探测 / 扫描"};
@@ -599,21 +626,26 @@ function drawTrend(rows){
   rows=asArr(rows);
   var box=el("trend");
   if(rows.length===0){box.innerHTML='<div class="empty">暂无数据</div>';return;}
-  var W=640,H=150,P=14,max=1;
+  var W=640,H=170,P=16,max=1;
   for(var i=0;i<rows.length;i++){if(rows[i].n>max)max=rows[i].n;}
   var bw=(W-P*2)/rows.length;
-  var s='<svg viewBox="0 0 '+W+" "+H+'" width="100%" height="150" role="img" aria-label="拦截趋势图">';
-  s+='<line x1="'+P+'" y1="'+(H-22)+'" x2="'+(W-P)+'" y2="'+(H-22)+'" stroke="#e5e7eb"/>';
+  var base=H-24,top=16;
+  var s='<svg viewBox="0 0 '+W+" "+H+'" width="100%" height="170" role="img" aria-label="拦截趋势图">';
+  for(var g=1;g<=3;g++){
+    var gy=base-(base-top)*g/4;
+    s+='<line x1="'+P+'" y1="'+gy.toFixed(1)+'" x2="'+(W-P)+'" y2="'+gy.toFixed(1)+'" stroke="#f0f2f4"/>';
+  }
+  s+='<line x1="'+P+'" y1="'+base+'" x2="'+(W-P)+'" y2="'+base+'" stroke="#e6e8eb"/>';
   for(var j=0;j<rows.length;j++){
-    var h=Math.round(rows[j].n/max*(H-46));
+    var h=Math.round(rows[j].n/max*(base-top));
     if(rows[j].n>0){
-      s+='<rect x="'+(P+j*bw).toFixed(1)+'" y="'+(H-22-h)+'" width="'+Math.max(bw-2,2).toFixed(1)+'" height="'+h+'" fill="#dc2626" opacity="0.78">'
+      s+='<rect x="'+(P+j*bw).toFixed(1)+'" y="'+(base-h)+'" width="'+Math.max(bw-2,2).toFixed(1)+'" height="'+h+'" rx="2" fill="#d64545" opacity="0.85">'
         +'<title>'+rows[j].n+' 次 / '+fmtT(rows[j].t)+'</title></rect>';
     }
   }
-  s+='<text x="'+P+'" y="'+(H-6)+'" font-size="10" fill="#9ca3af">'+fmtT(rows[0].t)+'</text>';
-  s+='<text x="'+(W-P)+'" y="'+(H-6)+'" font-size="10" fill="#9ca3af" text-anchor="end">'+fmtT(rows[rows.length-1].t)+'</text>';
-  s+='<text x="'+((P+W-P)/2)+'" y="12" font-size="10" fill="#9ca3af" text-anchor="middle">峰值 '+max+' 次/分钟</text>';
+  s+='<text x="'+P+'" y="'+(H-6)+'" font-size="10" fill="#98a1ab">'+fmtT(rows[0].t)+'</text>';
+  s+='<text x="'+(W-P)+'" y="'+(H-6)+'" font-size="10" fill="#98a1ab" text-anchor="end">'+fmtT(rows[rows.length-1].t)+'</text>';
+  s+='<text x="'+P+'" y="10" font-size="10" fill="#98a1ab">峰值 '+max+' 次/分钟</text>';
   s+='</svg>';
   box.innerHTML=s;
 }
@@ -628,8 +660,8 @@ function drawCats(blocked){
   for(var j=0;j<items.length;j++){
     var w=Math.round(items[j][1]/max*100);
     html+='<div class="barrow"><span class="lbl">'+(CATS[items[j][0]]||items[j][0])+'</span>'
-      +'<span class="track"><span class="bar" style="display:block;width:'+w+'%"></span></span>'
-      +'<span class="num" style="min-width:4em;text-align:right">'+items[j][1]+'</span></div>';
+      +'<span class="track"><span class="bar" style="width:'+w+'%"></span></span>'
+      +'<span class="num">'+items[j][1]+'</span></div>';
   }
   el("cats").innerHTML=html||'<div class="empty">暂无数据</div>';
 }
@@ -639,9 +671,9 @@ function drawTopIps(list){
   if(list.length===0){el("topips").innerHTML='<div class="empty">暂无攻击记录</div>';return;}
   var html="";
   for(var i=0;i<list.length;i++){
-    html+='<div class="barrow"><span class="lbl" style="font-family:monospace">'+list[i].ip+'</span>'
-      +'<span class="track"><span class="bar" style="display:block;width:'+Math.round(list[i].n/list[0].n*100)+'%"></span></span>'
-      +'<span class="num" style="min-width:4em;text-align:right">'+list[i].n+'</span></div>';
+    html+='<div class="barrow"><span class="lbl mono">'+list[i].ip+'</span>'
+      +'<span class="track"><span class="bar" style="width:'+Math.round(list[i].n/list[0].n*100)+'%"></span></span>'
+      +'<span class="num">'+list[i].n+'</span></div>';
   }
   el("topips").innerHTML=html;
 }
@@ -654,7 +686,7 @@ function fetchStats(){
     setText("st-60m",m60);
     setText("st-rate",(m60/60).toFixed(1));
     setText("st-active",j.banned_active);
-    el("foot").textContent="OpenLiteWaf v"+j.version+" · 运行 "+j.uptime_seconds+" 秒 · 日志缓存 "+j.logs_total+" 条 · 计数保存在内存中，进程重启后清零 · 数据每 30 秒自动刷新";
+    el("foot").textContent="OpenLiteWaf v"+j.version+" · 运行 "+j.uptime_seconds+" 秒 · 日志缓存 "+j.logs_total+" 条 · 计数保存在内存中，进程重启后清零";
     drawTrend(j.trends);
     drawCats(j.blocked||{});
     drawTopIps(j.top_ips);
