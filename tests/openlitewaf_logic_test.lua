@@ -384,7 +384,7 @@ do
     ok(NOW == before, "体检查不推进时钟")
 end
 
--- T17 body 豁免：日志内容端点不查 body
+-- T17 body 豁免：日志内容与分析端点不查 body
 do
     fresh()
     r = request({
@@ -393,6 +393,27 @@ do
     })
     ok(not r.blocked, "日志端点 body 豁免（业务误报防护）")
     ok(counter(ngx.shared.openlitewaf, "total") == 1, "豁免请求仍计入 total")
+
+    -- S1 回归：/v1/ai/analyse 端点直传含 SQL 错误栈的日志不被拦截
+    r = request({
+        uri = "/v1/ai/analyse", method = "POST", clen = "60",
+        body = '{"content":"SELECT * FROM users WHERE id=1; fail"}', evil = true, ip = "14.2.1.2",
+    })
+    ok(not r.blocked, "AI 分析端点 body 豁免（S1 回归）")
+
+    -- S2 回归：/v1/raw/abc/latest.log 正常放行，不命中 probe 扩展名规则
+    r = request({
+        uri = "/v1/raw/s123456/latest.log", method = "GET",
+        ip = "14.2.1.3",
+    })
+    ok(not r.blocked, "合法 raw 附件下载放行（S2 回归）")
+
+    -- S2 防御：raw 路径若包含恶意特征仍被拦截
+    r = request({
+        uri = "/v1/raw/s123456/../../etc/passwd", method = "GET",
+        hit = true, ip = "14.2.1.4",
+    })
+    ok(r.blocked, "raw 路径上的恶意特征仍被拦截（S2 防御）")
 end
 
 -- T18 body 尺寸超限跳过检查
@@ -525,6 +546,15 @@ do
     ok(r25.blocked, "T25 恢复的封禁仍拦截")
     ok(counter(d2, "sqli") == 1, "T25 恢复后封禁期不重复计类目")
     os.remove(dir .. "/snapshot.json")
+end
+
+-- T26 IPv6 脱敏与压缩展开
+do
+    local w = fresh()
+    ok(w._mask_ip("::1") == "0:0:0::*", "T26 IPv6 回环 ::1 展开脱敏")
+    ok(w._mask_ip("fe80::1") == "fe80:0:0::*", "T26 IPv6 压缩 fe80::1 展开脱敏")
+    ok(w._mask_ip("2001:db8::1") == "2001:db8:0::*", "T26 IPv6 压缩 2001:db8::1 展开脱敏")
+    ok(w._mask_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == "2001:0db8:85a3::*", "T26 IPv6 完整地址脱敏")
 end
 
 print(fail == 0 and "全部通过" or (fail .. " 项失败"))

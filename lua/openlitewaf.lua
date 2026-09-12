@@ -19,11 +19,15 @@ local CONFIG = {
     whitelist_prefixes = {
         "/.well-known/acme-challenge/",
     },
-    -- 请求体检查豁免前缀：日志内容端点的 body 是用户日志原文，
-    -- 任意文本命中攻击特征属正常业务（如分享安全日志），交由应用层输出转义防护。
+    -- 请求体检查豁免前缀：日志内容与分析端点的 body 是用户日志原文，
+    -- 任意文本命中攻击特征属正常业务（如分享安全日志或分析报错栈），交由应用层输出转义防护。
     body_exempt_prefixes = {
         "/v1/log",
         "/1/log",
+        "/v1/ai/analyse",
+        "/1/ai/analyse",
+        "/v1/analyse",
+        "/1/analyse",
     },
     -- CC 防御：window 秒内超过 limit 次请求即封禁该 IP ban 秒。
     -- 注意：须低于 nginx limit_req 静态限速，否则超额请求会先被 limit_req 以 503 丢弃，轮不到封禁。
@@ -209,9 +213,39 @@ end
 local function mask_ip(ip)
     if not ip or ip == "" then return "?" end
     if ip:find(":", 1, true) then
-        local groups = {}
-        for g in ip:gmatch("[0-9a-fA-F]+") do groups[#groups + 1] = g end
-        return table.concat(groups, ":", 1, math.min(3, #groups)) .. "::*"
+        local left, right = ip:match("^(.-)::(.*)$")
+        local top = {}
+        if left then
+            for g in left:gmatch("[0-9a-fA-F]+") do
+                top[#top + 1] = g
+                if #top == 3 then break end
+            end
+            if #top < 3 then
+                local right_groups = {}
+                for g in right:gmatch("[0-9a-fA-F]+") do
+                    right_groups[#right_groups + 1] = g
+                end
+                local zeros = 8 - #top - #right_groups
+                while #top < 3 and zeros > 0 do
+                    top[#top + 1] = "0"
+                    zeros = zeros - 1
+                end
+                local r_idx = 1
+                while #top < 3 and r_idx <= #right_groups do
+                    top[#top + 1] = right_groups[r_idx]
+                    r_idx = r_idx + 1
+                end
+            end
+        else
+            for g in ip:gmatch("[0-9a-fA-F]+") do
+                top[#top + 1] = g
+                if #top == 3 then break end
+            end
+        end
+        while #top < 3 do
+            top[#top + 1] = "0"
+        end
+        return table.concat(top, ":") .. "::*"
     end
     local head = ip:match("^(%d+%.%d+)%.")
     return head and (head .. ".*.*") or "?"
@@ -254,20 +288,31 @@ local function get_rules()
     return compiled_rules
 end
 
+-- 判断是否为 raw 日志/附件原文下载端点（如 /v1/raw/{id}/{filename} 或 /raw/{id}/{filename}）
+local function is_raw_file_request(uri)
+    if not uri then return false end
+    return uri:find("^/[^/]+/raw/[^/]+/[^/]+") ~= nil or uri:find("^/raw/[^/]+/[^/]+") ~= nil
+end
+
 -- 对单个 subject 顺序匹配规则，返回命中类目或 nil。
 -- 惰性编译优先走正则对象（减缓存查找），非法规则自动回退字符串缓存路径。
-local function match_rules(subject)
+-- exempt_probe_ext 为 true 时跳过常规扩展名探测（raw 附件下载场景），其余攻击特征仍全量检测。
+local function match_rules(subject, exempt_probe_ext)
     if not subject or subject == "" then return nil end
     local rules = get_rules()
-    for _, rule in ipairs(rules) do
-        local matcher = rule[2]
-        local hit
-        if type(matcher) == "table" then
-            hit = matcher:find(subject)
+    for i, rule in ipairs(rules) do
+        if exempt_probe_ext and rule[1] == "probe" and _M.RULES[i] and _M.RULES[i][2]:find([[%.%(sql|bak]]) then
+            -- 仅对 raw 附件下载端点跳过扩展名探测，避免 latest.log / config.yml 等正常文件被误杀
         else
-            hit = ngx.re.find(subject, matcher, "ijo")
+            local matcher = rule[2]
+            local hit
+            if type(matcher) == "table" then
+                hit = matcher:find(subject)
+            else
+                hit = ngx.re.find(subject, matcher, "ijo")
+            end
+            if hit then return rule[1] end
         end
-        if hit then return rule[1] end
     end
     return nil
 end
@@ -621,8 +666,9 @@ function _M.access()
         if decoded ~= body then subjects[#subjects + 1] = decoded end
     end
 
+    local is_raw_file = is_raw_file_request(uri)
     for _, subject in ipairs(subjects) do
-        local category = match_rules(subject)
+        local category = match_rules(subject, is_raw_file)
         if category then
             d:set("b:" .. ip, 1, CONFIG.sig_ban)
             record_ban_slot(d, CONFIG.sig_ban)
@@ -914,5 +960,7 @@ function _M.stats()
     ngx.header.content_type = "text/html; charset=utf-8"
     ngx.say(STATS_HTML)
 end
+
+_M._mask_ip = mask_ip
 
 return _M
