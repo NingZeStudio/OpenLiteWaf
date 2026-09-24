@@ -1,11 +1,12 @@
 -- OpenLiteWaf — 极简 Nginx Lua WAF
--- CC 防御 + 常见攻击特征拦截（SQL 注入 / XSS / 路径穿越 / 命令执行 / 探测扫描），
--- 触发时返回 403 红色极简警告页；提供公开安全统计页（/security）：
--- 实时拦截趋势图、类别分布、来源 IP Top（脱敏）、攻击日志分页（最近 500 条）、
--- 当前封禁 IP 近似计数。
+-- CC 防御（超限返回 429，不封 IP）+ 常见攻击特征拦截（SQL 注入 / XSS / 路径穿越 /
+-- 命令执行 / 探测扫描），特征命中返回 403 红色极简警告页并按窗口累计次数封禁 IP；
+-- 提供公开安全统计页（/security）：实时拦截趋势图、类别分布、来源 IP Top（脱敏）、
+-- 攻击日志分页（最近 500 条，含命中规则与匹配对象）、当前封禁 IP 近似计数与原因。
+-- 运维端点 /security/unban 与 /security/bans 需 OPENLITEWAF_ADMIN_TOKEN 令牌。
 -- 文档与集成方式见 OpenLiteWaf/README.md。
 
-local _M = { _VERSION = "1.2.0" }
+local _M = { _VERSION = "1.3.0" }
 
 local cjson = require "cjson.safe"
 
@@ -19,8 +20,8 @@ local CONFIG = {
     whitelist_prefixes = {
         "/.well-known/acme-challenge/",
     },
-    -- 请求体检查豁免前缀：日志内容与分析端点的 body 是用户日志原文，
-    -- 任意文本命中攻击特征属正常业务（如分享安全日志或分析报错栈），交由应用层输出转义防护。
+    -- 请求体检查豁免前缀：以下端点的 body 是用户或管理员提交的原文（日志正文、分析输入、
+    -- 遥测载荷、知识库 Markdown），任意文本命中攻击特征属正常业务，交由应用层输出转义防护。
     body_exempt_prefixes = {
         "/v1/log",
         "/1/log",
@@ -28,12 +29,29 @@ local CONFIG = {
         "/1/ai/analyse",
         "/v1/analyse",
         "/1/analyse",
+        -- 前端遥测 SDK 拦截 fetch/XHR 后原样上报 endpoint/message/stack，
+        -- 载荷里必然出现 main.log / config.yml 之类的文件名
+        "/v1/telemetry",
+        "/1/telemetry",
+        -- 管理端提交知识库正文与提示词原文，含反引号、curl、相对路径属正常书写，
+        -- 且该前缀本身受 token 鉴权与应用层防穿越约束
+        "/v1/admin",
+        "/1/admin",
     },
-    -- CC 防御：window 秒内超过 limit 次请求即封禁该 IP ban 秒。
-    -- 注意：须低于 nginx limit_req 静态限速，否则超额请求会先被 limit_req 以 503 丢弃，轮不到封禁。
-    cc = { window = 10, limit = 240, ban = 600 },
+    -- CC 防御：window 秒内超过 limit 次请求即对该 IP 返回 429。不写封禁名单：
+    -- 计数键按窗口分桶，超限后同一窗口内持续 429，跨窗口自动恢复。
+    -- 注意：须低于 nginx limit_req 静态限速，否则超额请求会先被 limit_req 以 503 丢弃，轮不到 CC。
+    cc = { window = 10, limit = 240 },
     -- 命中攻击特征后的封禁秒数
     sig_ban = 600,
+    -- 窗口内累计命中多少次攻击特征才封禁 IP（1 = 命中即封，退回旧行为）。
+    -- 单次命中本身已 403，封禁的意义是压制复读型扫描器；对误判而言，
+    -- 这一步把爆炸半径从「该 IP 全站 403 十分钟」降级为「一次 403」。
+    sig_strikes = 3,
+    sig_strike_window = 600,
+    -- 运维端点（/security/unban 与 /security/bans）令牌：读 nginx 环境变量；
+    -- 未配置或长度 < 16 时端点一律 404（fail-closed）。admin_token 仅供回归测试覆写。
+    admin_token_env = "OPENLITEWAF_ADMIN_TOKEN",
     -- 攻击日志容量（环形槽位，最新覆盖最旧）
     log_capacity = 500,
     -- 攻击日志每页条数
@@ -61,8 +79,16 @@ _M.CONFIG = CONFIG  -- 导出供回归测试覆盖（如 data_dir）
 
 -- ─────────── 攻击特征规则（PCRE，语法同 ngx.re）───────────
 -- 按顺序匹配，命中即停。类目：sqli / xss / traversal / rce / probe。
--- 匹配对象依次为：原始 request_uri、完整解码 request_uri（含 query）、
--- 规范化 uri、User-Agent、请求体（及其一次 URL 解码）。
+-- 匹配对象依次为：原始 request_uri、规范化 uri、User-Agent、
+-- 完整解码 request_uri（含 query）、请求体（及其一次 URL 解码）。
+-- 每条规则可选第三元素声明「作用域」，取值 uri / path / ua / body（空格分隔）：
+--   省略  = 作用于全部匹配对象（注入与跨站等真实 payload 需要看 body）
+--   uri   = 仅原始与解码 request_uri（含 query）
+--   path  = 仅规范化后的请求路径（不含 query）
+--   ua    = 仅 User-Agent
+--   body  = 仅请求体
+-- 路径形态的探测特征必须收窄：请求体与 UA 里出现 /.git/、phpmyadmin、main.log、config.yml
+-- 只是文本内容（日志分享、知识库文档、前端遥测），不构成探测，扫它们只会误封。
 -- RULES-BEGIN（tmp/ 下的 PHP 回归测试按此格式解析）
 _M.RULES = {
     -- SQL 注入
@@ -116,24 +142,30 @@ _M.RULES = {
     { "rce",      [[\bbase64_decode\s*\(]] },
     { "rce",      [[/proc/self/environ]] },
     -- 探测 / 扫描路径（本站无 PHP/JSP 等动态文件与运维后台，出现即视为探测）
-    { "probe",    [[\.php(\?|$)]] },
-    { "probe",    [[\.(asp|aspx|jsp|jspx)(\?|$)]] },
-    { "probe",    [[/(\.env|\.git|\.svn|\.hg|\.DS_Store|\.htaccess|\.htpasswd)(/|\?|$)]] },
-    { "probe",    [[/(\.aws|\.ssh|\.docker)(/|$)]] },
-    { "probe",    [[phpmyadmin]] },
-    { "probe",    [[wp-(admin|login|content|config|includes|json)]] },
-    { "probe",    [[/actuator(/|\?|$)]] },
-    { "probe",    [[/cgi-bin/]] },
-    { "probe",    [[^/admin(\?|$)]] },
-    { "probe",    [[/id_rsa(\?|$)]] },
-    { "probe",    [[\.(sql|bak|backup|old|ini|conf|cfg|log|yml|yaml|json|xml)(\?|$|(?![\w.]))]] },
-    { "probe",    [[/backup(/|\?|$)]] },
-    { "probe",    [[/server-status]] },
-    { "probe",    [[/(druid|nacos|jenkins|solr)(/|\?|$)]] },
-    { "probe",    [[/manager/html]] },
-    { "probe",    [[/debug/vars]] },
+    { "probe",    [[\.php(\?|$)]], "uri" },
+    { "probe",    [[\.(asp|aspx|jsp|jspx)(\?|$)]], "uri" },
+    { "probe",    [[/(\.env|\.git|\.svn|\.hg|\.DS_Store|\.htaccess|\.htpasswd)(/|\?|$)]], "uri" },
+    { "probe",    [[/(\.aws|\.ssh|\.docker)(/|$)]], "uri" },
+    { "probe",    [[phpmyadmin]], "uri" },
+    { "probe",    [[wp-(admin|login|content|config|includes|json)]], "uri" },
+    { "probe",    [[/actuator(/|\?|$)]], "uri" },
+    { "probe",    [[/cgi-bin/]], "uri" },
+    { "probe",    [[^/admin(\?|$)]], "uri" },
+    { "probe",    [[/id_rsa(\?|$)]], "uri" },
+    -- 敏感文件扩展名与具名敏感文件：只看请求路径本身，不看 query（?file=latest.log、
+    -- ?path=config.json 是正常业务参数），也不看 body/UA（正文里提到文件名不构成探测）。
+    -- json 与 xml 已从通用扩展名列表中剔除（本站无静态 JSON/XML 敏感资产，命中方几乎全是
+    -- 正常请求：/sitemap.xml、前端附件名、遥测里的上报地址），改由下方具名文件精确覆盖。
+    { "probe",    [[\.(sql|bak|backup|old|ini|conf|cfg|log|yml|yaml)(\?|$|(?![\w.]))|/(web\.config|settings\.json|appsettings\.json|database\.ya?ml|\.git-credentials|\.npmrc|\.bash_history)(\?|$|(?![\w.]))]], "path" },
+    { "probe",    [[/backup(/|\?|$)]], "uri" },
+    { "probe",    [[/server-status]], "uri" },
+    { "probe",    [[/(druid|nacos|jenkins|solr)(/|\?|$)]], "uri" },
+    { "probe",    [[/manager/html]], "uri" },
+    { "probe",    [[/debug/vars]], "uri" },
+    -- multipart 上传文件名带可执行后缀：只存在于请求体，上面的 uri/path 规则看不见它
+    { "probe",    [[filename="[^"\r\n]{0,64}\.(php|phtml|phar|jsp|jspx|asp|aspx|cer)[^"\r\n]{0,8}"]], "body" },
     -- 扫描器 / 攻击工具 User-Agent
-    { "probe",    [[\b(sqlmap|nikto|nmap|masscan|zgrab|zmap|gobuster|dirbuster|dirb|dirsearch|feroxbuster|wpscan|acunetix|netsparker|nessus|openvas|arachni|havij|sqlninja|wfuzz|ffuf|nuclei|xray|afrog|whatweb|subfinder|(?<!python-)httpx|naabu|amass|arjun|wafw00f|hydra)\b]] },
+    { "probe",    [[\b(sqlmap|nikto|nmap|masscan|zgrab|zmap|gobuster|dirbuster|dirb|dirsearch|feroxbuster|wpscan|acunetix|netsparker|nessus|openvas|arachni|havij|sqlninja|wfuzz|ffuf|nuclei|xray|afrog|whatweb|subfinder|(?<!python-)httpx|naabu|amass|arjun|wafw00f|hydra)\b]], "ua uri" },
 }
 -- RULES-END
 
@@ -201,12 +233,19 @@ local function whitelisted(uri)
     return false
 end
 
+-- 运维端点（解封与封禁查询）。必须等值比较：写成前缀匹配会让 /security/unban<anything>
+-- 绕过封禁名单检查，与 skip_signature 的 S1 回归守的是同一类问题。
+local function is_admin_endpoint(uri)
+    return uri == CONFIG.stats_prefix .. "/unban" or uri == CONFIG.stats_prefix .. "/bans"
+end
+
 local function skip_signature(uri)
     -- 与 nginx location = 精确匹配语义一致；前缀匹配会让 /security<任意后缀>
-    -- 绕过特征检查（S1），故仅豁免统计页自身的三个精确 URI
+    -- 绕过特征检查（S1），故仅豁免统计页与运维端点自身的精确 URI
     return uri == CONFIG.stats_prefix
         or uri == CONFIG.stats_prefix .. "/stats"
         or uri == CONFIG.stats_prefix .. "/logs"
+        or is_admin_endpoint(uri)
 end
 
 -- IP 脱敏：公开统计页不展示完整 IP（隐私约定），IPv4 留前两段、IPv6 留前三组
@@ -262,6 +301,48 @@ pcall(require, "resty.core.re")
 -- 阶段调用，必须在请求阶段首次用时编译；每个 worker 各自缓存一份。
 local compiled_rules
 
+-- ───────────── 匹配对象作用域 ─────────────
+-- 规则的可选第三元素声明它作用于哪些匹配对象（见 RULES 上方注释）。
+-- 位掩码而非枚举：回归测试跑在纯 lua5.1 下，不能依赖 LuaJIT 的 bit 库。
+local KIND = { uri = 1, path = 2, ua = 4, body = 8 }
+local ALL_KINDS = KIND.uri + KIND.path + KIND.ua + KIND.body
+
+local function band(a, b)
+    local r, m = 0, 1
+    while a > 0 or b > 0 do
+        local x, y = a % 2, b % 2
+        if x == 1 and y == 1 then r = r + m end
+        a, b, m = (a - x) / 2, (b - y) / 2, m * 2
+    end
+    return r
+end
+
+-- 规则序号 => 作用域掩码（worker 级惰性构建）。编译路径与字符串回退路径与 _M.RULES
+-- 同下标，因此两条路径共用一张掩码表。
+local scope_masks
+local function scope_mask_of(i)
+    if not scope_masks then
+        scope_masks = {}
+        for k, rule in ipairs(_M.RULES) do
+            local m = ALL_KINDS
+            if type(rule[3]) == "string" then
+                m = 0
+                for tok in rule[3]:gmatch("[a-z]+") do
+                    m = m + (KIND[tok] or 0)
+                end
+                if m == 0 then
+                    -- 作用域拼错时退化为全对象：宁可多扫，绝不能静默地把一条规则关掉
+                    ngx.log(ngx.ERR, "[OpenLiteWaf] rule #", k, " has unusable scope '",
+                        rule[3], "'; treated as all objects")
+                    m = ALL_KINDS
+                end
+            end
+            scope_masks[k] = m
+        end
+    end
+    return scope_masks[i] or ALL_KINDS
+end
+
 -- compile 是否可用（模块加载时探测一次；resty.core.re 加载成功后为 function）
 local COMPILE_AVAILABLE = type(ngx.re.compile) == "function"
 
@@ -294,16 +375,32 @@ local function is_raw_file_request(uri)
     return uri:find("^/[^/]+/raw/[^/]+/[^/]+") ~= nil or uri:find("^/raw/[^/]+/[^/]+") ~= nil
 end
 
--- 对单个 subject 顺序匹配规则，返回命中类目或 nil。
--- 惰性编译优先走正则对象（减缓存查找），非法规则自动回退字符串缓存路径。
--- exempt_probe_ext 为 true 时跳过常规扩展名探测（raw 附件下载场景），其余攻击特征仍全量检测。
-local function match_rules(subject, exempt_probe_ext)
+-- 敏感文件扩展名探测规则的序号：raw 附件的下载路径天然带 latest.log / launcher.log
+-- 等扩展名，须跳过该条；按正则文本定位一次，避免逐请求再做模式匹配。
+local probe_ext_index
+local function probe_ext_rule()
+    if probe_ext_index == nil then
+        probe_ext_index = 0
+        for i, rule in ipairs(_M.RULES) do
+            if rule[1] == "probe" and type(rule[2]) == "string"
+                and rule[2]:find([[\.(sql|bak]], 1, true) then
+                probe_ext_index = i
+                break
+            end
+        end
+    end
+    return probe_ext_index
+end
+
+-- 对单个匹配对象顺序扫描规则，命中即停，返回 类目, 规则序号。
+-- kind 取 KIND.uri / path / ua / body，声明作用域不含该 kind 的规则直接跳过；
+-- skip_rule 为需额外跳过的规则序号（0 = 无）。惰性编译优先走正则对象（减缓存查找），
+-- 非法规则自动回退字符串缓存路径，两条路径与 _M.RULES 同下标。
+local function match_rules(subject, kind, skip_rule)
     if not subject or subject == "" then return nil end
     local rules = get_rules()
     for i, rule in ipairs(rules) do
-        if exempt_probe_ext and rule[1] == "probe" and _M.RULES[i] and _M.RULES[i][2]:find([[%.%(sql|bak]]) then
-            -- 仅对 raw 附件下载端点跳过扩展名探测，避免 latest.log / config.yml 等正常文件被误杀
-        else
+        if i ~= skip_rule and band(scope_mask_of(i), kind) ~= 0 then
             local matcher = rule[2]
             local hit
             if type(matcher) == "table" then
@@ -311,7 +408,7 @@ local function match_rules(subject, exempt_probe_ext)
             else
                 hit = ngx.re.find(subject, matcher, "ijo")
             end
-            if hit then return rule[1] end
+            if hit then return rule[1], i end
         end
     end
     return nil
@@ -323,18 +420,27 @@ function _M._rules_compiled()
     return compiled_rules
 end
 
+-- 测试可见性：暴露规则作用域掩码，用于断言"路径形态的探测特征不作用于 body/UA"。
+function _M._rule_scope_mask(i)
+    return scope_mask_of(i)
+end
+
 -- ───────────── 攻击日志 / 趋势 / 封禁槽位（shared dict）─────────────
 -- shared dict 不支持键枚举，环形槽位是唯一的无锁写入方案：
 -- 全局序号 incr 定槽，读端按序号回溯；同槽覆盖即自然淘汰最旧数据。
 
--- 写入一条攻击日志（URI 中 token 参数打码，防止泄露到公开统计页）
-local function log_attack(d, category)
+-- 写入一条攻击日志（URI 中 token 参数打码，防止泄露到公开统计页）。
+-- rule 为命中的规则序号、via 为命中所在的匹配对象（uri/path/ua/body）——二者足以
+-- 定位误封来源；命中片段本身绝不记录：请求体内容不得进入 shared dict、快照与公开页。
+local function log_attack(d, category, rule_no, via)
     local seq = d:incr("log_seq", 1, 0) or 0
     local uri = ngx.var.request_uri or ngx.var.uri or "-"
     uri = uri:gsub("([?&]token=)[^&]*", "%1***")
     local entry = {
         t = math.floor(ngx.now()),
         cat = category,
+        rule = rule_no or 0,
+        via = via or "-",
         ip = mask_ip(ngx.var.remote_addr),
         u = uri:sub(1, CONFIG.log_field_max),
         a = (ngx.var.http_user_agent or "-"):sub(1, CONFIG.log_field_max),
@@ -358,24 +464,41 @@ local function bump_trend(d)
 end
 
 -- 记录一次新封禁的到期时间（活跃封禁数的近似数据源）。
--- br:* 与 bs:* 同槽位记录封禁 IP，供快照恢复 b:<ip> 封禁名单
-local function record_ban_slot(d, ttl)
+-- br:* 与 bs:* 同槽位记录封禁 IP 与原因，供快照恢复 b:<ip> 封禁名单。
+-- why 形如 "probe#57" / "cc"，用于在 /security 上回答"这个 IP 为什么被封"。
+local function record_ban_slot(d, ttl, why)
     local seq = d:incr("ban_seq", 1, 0) or 0
     local slot = (seq - 1) % CONFIG.ban_slots
     d:set("bs:" .. slot, ngx.now() + ttl, ttl)
     d:set("br:" .. slot, ngx.var.remote_addr or "unknown", ttl)
+    d:set("bx:" .. slot, why or "sig", ttl)
     bump(d, "banned")
 end
 
--- 当前活跃封禁数（近似）：遍历槽位统计未到期的封禁
-local function count_active_bans(d)
-    local now = ngx.now()
-    local n = 0
-    for i = 0, CONFIG.ban_slots - 1 do
-        local exp = d:get("bs:" .. i)
-        if exp and exp > now then n = n + 1 end
+-- 统计一个 IP 在窗口内累计命中攻击特征的次数（达到 sig_strikes 才封禁，见 access）。
+local function bump_strike(d, ip)
+    local key = "s:" .. ip
+    local n = d:incr(key, 1, 0) or 0
+    if n == 1 then
+        d:expire(key, CONFIG.sig_strike_window)
     end
     return n
+end
+
+-- 当前活跃封禁数（近似）与封禁原因分布：遍历槽位统计未到期的封禁。
+-- 旧快照没有 bx:* 记录，原因归 "?"，不影响恢复。
+local function count_active_bans(d)
+    local now = ngx.now()
+    local n, reasons = 0, {}
+    for i = 0, CONFIG.ban_slots - 1 do
+        local exp = d:get("bs:" .. i)
+        if exp and exp > now then
+            n = n + 1
+            local why = d:get("bx:" .. i) or "?"
+            reasons[why] = (reasons[why] or 0) + 1
+        end
+    end
+    return n, reasons
 end
 
 -- 按页读取攻击日志（最新在前）
@@ -464,28 +587,36 @@ local function read_body_data(uri)
     return data
 end
 
-local function deny(d, category)
+-- 拒绝请求并记账。category 为特征类目、"cc"（频率超限）或 nil（IP 已在封禁名单内）；
+-- rule_no / via 记录命中的规则序号与匹配对象。状态码：CC 返回 429（可退避重试、不封 IP），
+-- 特征命中与封禁期返回 403。
+local function deny(d, category, rule_no, via)
     ngx.ctx.olw_blocked = true  -- 供 OpenLiteStats log 阶段排除被拦截请求
     bump(d, "blocked")
     if category then
         bump(d, category)
-        log_attack(d, category)
+        log_attack(d, category, rule_no, via)
         bump_trend(d)
     end
     -- 服务端审计日志（含 IP，仅入 nginx error log，不影响统计页隐私约定）
     ngx.log(ngx.WARN, "[OpenLiteWaf] block ip=", ngx.var.remote_addr or "?",
-        " rule=", category or "ban", " uri=", ngx.var.uri or "-")
+        " rule=", (category or "ban") .. (rule_no and rule_no > 0 and "#" .. rule_no or ""),
+        " via=", via or "-", " uri=", ngx.var.uri or "-")
     -- 标题按拦截状态区分：特征命中 / CC 频率 / 封禁期。高亮词随文案变化。
     local title
+    local status = 403
     if category == "cc" then
         title = '您的请求<span class="highlight">频率过高</span>。'
+        status = 429
+        local left = CONFIG.cc.window - (ngx.now() % CONFIG.cc.window)
+        ngx.header["Retry-After"] = tostring(math.max(1, math.ceil(left)))
     elseif category == nil then
         title = '您的访问已被<span class="highlight">临时封禁</span>。'
     else
         title = '我们认为您的请求是<span class="highlight">恶意</span>的。'
     end
     local page = tpl_replace(WARN_HTML, "{{TITLE}}", title)
-    ngx.status = 403
+    ngx.status = status
     ngx.header.content_type = "text/html; charset=utf-8"
     ngx.say(page)
     -- 官方推荐写法：状态码与响应体已发送后，用 ngx.exit(ngx.HTTP_OK) 结束整个请求，
@@ -531,6 +662,9 @@ function _M.init()
                 if remaining > 0 and e.ip then
                     d:set("bs:" .. e.slot, e.exp, math.ceil(remaining))
                     d:set("br:" .. e.slot, e.ip, math.ceil(remaining))
+                    if e.why then
+                        d:set("bx:" .. e.slot, e.why, math.ceil(remaining))
+                    end
                     d:set("b:" .. e.ip, 1, math.ceil(remaining))
                 end
             end
@@ -564,7 +698,7 @@ function _M._save(d)
         local exp = d:get("bs:" .. slot)
         local ip = d:get("br:" .. slot)
         if exp and exp > now and ip then
-            bans[#bans + 1] = { slot = slot, exp = exp, ip = ip }
+            bans[#bans + 1] = { slot = slot, exp = exp, ip = ip, why = d:get("bx:" .. slot) }
         end
     end
     local trends = {}
@@ -627,12 +761,14 @@ function _M.access()
 
     local ip = ngx.var.remote_addr or "unknown"
 
-    -- 封禁名单检查（CC 与特征命中共用）
-    if d:get("b:" .. ip) then
+    -- 封禁名单检查：运维端点不受封禁约束，否则被误封的管理者无法自助解封
+    if not is_admin_endpoint(uri) and d:get("b:" .. ip) then
         return deny(d, nil)
     end
 
-    -- CC 防御：固定窗口计数（键按窗口分桶，TTL 两倍窗口自动回收）
+    -- CC 防御：固定窗口计数（键按窗口分桶，TTL 两倍窗口自动回收）。
+    -- 超限只返回 429 不写封禁名单：同一窗口内后续请求继续 429，跨窗口自动恢复；
+    -- CC 不是攻击证据，对 CGNAT/校园网出口不该把整个出口封 10 分钟。
     local window = CONFIG.cc.window
     local bucket = math.floor(ngx.now() / window)
     local key = "r:" .. ip .. ":" .. bucket
@@ -641,38 +777,44 @@ function _M.access()
         d:expire(key, window * 2)
     end
     if n and n > CONFIG.cc.limit then
-        d:set("b:" .. ip, 1, CONFIG.cc.ban)
-        record_ban_slot(d, CONFIG.cc.ban)
         return deny(d, "cc")
     end
 
-    -- 统计页自身：跳过特征匹配，避免规则误伤公开页
+    -- 统计页与运维端点自身：跳过特征匹配，避免规则误伤公开页
     if skip_signature(uri) then return end
 
-    -- 特征匹配 subject，实际顺序为：原始 request_uri（抓 %2e%2e 等编码特征）→
-    -- 规范化 uri → User-Agent → 完整解码 request_uri（含 query，修复 %20 不匹配
-    -- \s 的绕过）→ 请求体 → 请求体的一次 URL 解码。规则"命中即停"，
-    -- 同一 payload 命中多类时归入先匹配到的类目。
-    local subjects = { ngx.var.request_uri, uri, ngx.var.http_user_agent }
+    -- 匹配对象与顺序：原始 request_uri（抓 %2e%2e 等编码特征）→ 规范化 uri → User-Agent →
+    -- 完整解码 request_uri（修复 %20 不匹配 \s 的绕过）→ 请求体 → 请求体的一次 URL 解码。
+    -- 规则"命中即停"，同一 payload 命中多类时归入先匹配到的类目；每条规则只参与
+    -- 它声明了作用域的匹配对象（KIND），路径形态的探测特征因此不会去扫 body/UA。
+    local subjects = {
+        { ngx.var.request_uri, KIND.uri, "uri" },
+        { uri, KIND.path, "path" },
+        { ngx.var.http_user_agent, KIND.ua, "ua" },
+    }
     local req_uri = ngx.var.request_uri
     if req_uri and req_uri ~= "" then
         local decoded = ngx.unescape_uri(req_uri)
-        if decoded ~= req_uri then subjects[#subjects + 1] = decoded end
+        if decoded ~= req_uri then subjects[#subjects + 1] = { decoded, KIND.uri, "uri" } end
     end
     local body = read_body_data(uri)
     if body then
-        subjects[#subjects + 1] = body
+        subjects[#subjects + 1] = { body, KIND.body, "body" }
         local decoded = ngx.unescape_uri(body)
-        if decoded ~= body then subjects[#subjects + 1] = decoded end
+        if decoded ~= body then subjects[#subjects + 1] = { decoded, KIND.body, "body" } end
     end
 
-    local is_raw_file = is_raw_file_request(uri)
-    for _, subject in ipairs(subjects) do
-        local category = match_rules(subject, is_raw_file)
+    -- raw 附件下载路径天然带 .log/.yml 等扩展名，跳过该条规则，其余特征全量检测
+    local skip_rule = is_raw_file_request(uri) and probe_ext_rule() or 0
+    for _, s in ipairs(subjects) do
+        local category, rule_no = match_rules(s[1], s[2], skip_rule)
         if category then
-            d:set("b:" .. ip, 1, CONFIG.sig_ban)
-            record_ban_slot(d, CONFIG.sig_ban)
-            return deny(d, category)
+            -- 单次命中只让这一次请求 403；窗口内累计达阈值才封禁整个 IP
+            if bump_strike(d, ip) >= CONFIG.sig_strikes then
+                d:set("b:" .. ip, 1, CONFIG.sig_ban)
+                record_ban_slot(d, CONFIG.sig_ban, category .. "#" .. rule_no)
+            end
+            return deny(d, category, rule_no, s[3])
         end
     end
 end
@@ -751,10 +893,10 @@ footer{margin-top:2rem;padding-top:1rem;border-top:1px solid #e6e8eb;color:#98a1
 <h2>攻击来源 IP Top <small>最近 500 条 · 已脱敏</small></h2>
 <div class="panel" id="topips"><div class="empty">加载中…</div></div>
 
-<h2>攻击日志 <small>最近 500 条 · 每页 50 条</small></h2>
+<h2>攻击日志 <small>最近 500 条 · 每页 50 条 · 规则 #N 为命中的特征规则序号，其后为命中所在的匹配对象（uri 请求串 / path 请求路径 / ua 客户端标识 / body 请求体）</small></h2>
 <div class="tablewrap">
 <table>
-<thead><tr><th>时间</th><th>类目</th><th>来源 IP</th><th>URI</th><th>User-Agent</th></tr></thead>
+<thead><tr><th>时间</th><th>类目</th><th>规则</th><th>来源 IP</th><th>URI</th><th>User-Agent</th></tr></thead>
 <tbody id="logrows"></tbody>
 </table>
 </div>
@@ -862,7 +1004,7 @@ function fetchLogs(page){
     tb.textContent="";
     if(rows.length===0){
       var tr=document.createElement("tr"),td=document.createElement("td");
-      td.colSpan=5;td.className="empty";td.textContent="暂无攻击记录";
+      td.colSpan=6;td.className="empty";td.textContent="暂无攻击记录";
       tr.appendChild(td);tb.appendChild(tr);
     }else{
       for(var i=0;i<rows.length;i++){
@@ -870,10 +1012,12 @@ function fetchLogs(page){
         var t1=document.createElement("td");t1.className="num";t1.textContent=fmtDT(e.t);
         var t2=document.createElement("td");var tag=document.createElement("span");
         tag.className="tag";tag.textContent=CATS[e.cat]||e.cat;t2.appendChild(tag);
+        var t2b=document.createElement("td");t2b.className="num";
+        t2b.textContent=e.rule?("#"+e.rule+" "+(e.via||"-")):"-";
         var t3=document.createElement("td");t3.style.fontFamily="monospace";t3.textContent=e.ip;
         var t4=document.createElement("td");t4.textContent=e.u;
         var t5=document.createElement("td");t5.textContent=e.a;
-        tr.appendChild(t1);tr.appendChild(t2);tr.appendChild(t3);tr.appendChild(t4);tr.appendChild(t5);
+        tr.appendChild(t1);tr.appendChild(t2);tr.appendChild(t2b);tr.appendChild(t3);tr.appendChild(t4);tr.appendChild(t5);
         tb.appendChild(tr);
       }
     }
@@ -910,6 +1054,11 @@ local function build_stats(d)
         blocked_60m = blocked_60m + n
     end
 
+    local banned, ban_reasons = 0, {}
+    if d then
+        banned, ban_reasons = count_active_bans(d)
+    end
+
     return {
         name = "OpenLiteWaf",
         version = _M._VERSION,
@@ -917,7 +1066,9 @@ local function build_stats(d)
         requests_total = c("total"),
         blocked_total = c("blocked"),
         blocked_60m = blocked_60m,
-        banned_active = d and count_active_bans(d) or 0,
+        banned_active = banned,
+        -- 封禁原因分布（键形如 "probe#57" / "cc" / "?"：旧快照恢复的封禁没有原因）
+        ban_reasons = ban_reasons,
         logs_total = d and math.min(d:get("log_seq") or 0, CONFIG.log_capacity) or 0,
         blocked = {
             cc = c("cc"),
@@ -930,6 +1081,98 @@ local function build_stats(d)
         trends = trends,
         top_ips = d and top_from_logs(d) or {},
     }
+end
+
+-- ───────────────────── 运维端点（需令牌）─────────────────────
+-- /security 系列公开页无需鉴权，而解封是特权操作：独立令牌走请求头校验，
+-- 未配置或长度不足一律 404（不区分"不存在"与"无权限"，不给探测反馈）。
+local function admin_token()
+    local t = CONFIG.admin_token
+    if t == nil and os.getenv then
+        t = os.getenv(CONFIG.admin_token_env)
+    end
+    if type(t) ~= "string" or #t < 16 then return nil end
+    return t
+end
+
+-- 长度不等即返回，等长时逐字节全比不短路，避免按前缀猜令牌的时序侧信道
+local function const_eq(a, b)
+    if type(a) ~= "string" or type(b) ~= "string" or #a ~= #b then return false end
+    local diff = 0
+    for i = 1, #a do
+        diff = diff + math.abs((a:byte(i) or 0) - (b:byte(i) or 0))
+    end
+    return diff == 0
+end
+
+-- 清除一个 IP 的全部封禁痕迹：封禁名单、strike 计数、CC 窗口计数与封禁槽位。
+-- 槽位必须一并清 —— _save 从槽位收集 bans[]，否则下一次快照会把这条封禁写回，
+-- init 再据此在重启时复活 b:<ip>（"docker restart 清不掉误封"的成因）。
+local function purge_ban(d, ip)
+    local removed = d:get("b:" .. ip) and 1 or 0
+    d:delete("b:" .. ip)
+    d:delete("s:" .. ip)
+    local bucket = math.floor(ngx.now() / CONFIG.cc.window)
+    d:delete("r:" .. ip .. ":" .. bucket)
+    d:delete("r:" .. ip .. ":" .. (bucket - 1))
+    for slot = 0, CONFIG.ban_slots - 1 do
+        if d:get("br:" .. slot) == ip then
+            d:delete("bs:" .. slot)
+            d:delete("br:" .. slot)
+            d:delete("bx:" .. slot)
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+-- content_by_lua：GET /security/bans 列出现封禁与原因；
+-- POST /security/unban?ip= 解除指定 IP 的封禁。
+function _M.admin()
+    local d = dict()
+    local tok = admin_token()
+    -- 令牌只认请求头：走 query 会被 nginx access_log 与浏览器历史/Referer 记录下来
+    local given = ngx.var.http_x_openlitewaf_token
+    if not d or not tok or not const_eq(tok, given) then
+        ngx.log(ngx.WARN, "[OpenLiteWaf] admin denied ip=", ngx.var.remote_addr or "?",
+            " token_configured=", tok and "yes" or "no")
+        return ngx.exit(ngx.HTTP_NOT_FOUND)
+    end
+
+    local uri = ngx.var.uri or ""
+    ngx.header.content_type = "application/json; charset=utf-8"
+    ngx.header["Cache-Control"] = "no-store"
+
+    if uri == CONFIG.stats_prefix .. "/bans" then
+        local now = ngx.now()
+        local out = {}
+        for slot = 0, CONFIG.ban_slots - 1 do
+            local exp = d:get("bs:" .. slot)
+            if exp and exp > now then
+                out[#out + 1] = {
+                    slot = slot,
+                    ip = d:get("br:" .. slot),
+                    ttl = math.ceil(exp - now),
+                    why = d:get("bx:" .. slot) or "?",
+                }
+            end
+        end
+        local banned = count_active_bans(d)
+        return ngx.say(cjson.encode({ ok = true, banned_active = banned, bans = out }) or "{}")
+    end
+
+    local ip = ngx.var.arg_ip
+    -- 只接受 IP 字面量：拼错的值会变成 shared dict 里的任意键名（如 total，或别人的 b:<ip>）
+    if not ip or #ip > 45 or not ip:match("^[0-9a-fA-F:.]+$") then
+        ngx.status = 400
+        return ngx.say('{"ok":false,"error":"bad ip"}')
+    end
+    local removed = purge_ban(d, ip)
+    -- 立即落盘：否则 60 秒内的 restart 会由 init 从旧快照复活这条封禁
+    pcall(_M._save, d)
+    ngx.log(ngx.NOTICE, "[OpenLiteWaf] unban ip=", ip, " removed=", removed)
+    local banned = count_active_bans(d)
+    ngx.say(cjson.encode({ ok = true, ip = ip, removed = removed, banned_active = banned }) or "{}")
 end
 
 function _M.stats()

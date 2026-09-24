@@ -53,6 +53,12 @@ local function newdict()
         end
         return false
     end
+    -- ngx.shared.DICT:delete —— 解封通道清封禁键与槽位依赖它
+    function d:delete(k)
+        local had = self.store[k] ~= nil
+        self.store[k] = nil
+        return had
+    end
     return d
 end
 
@@ -96,7 +102,10 @@ ngx = {
     header = {},
     status = nil,
     HTTP_OK = 200,
+    HTTP_NOT_FOUND = 404,
     WARN = 4,
+    ERR = 1,
+    NOTICE = 5,
     log = function() end,
     say = function(body) SAID = body end,
     exit = function(code) EXITED = code; error({ exit = code }) end,
@@ -218,6 +227,7 @@ local function request(opts)
     REQ_METHOD = opts.method or "GET"
     REQ_BODY = opts.body
     ngx.status = nil
+    ngx.header = {}
     SAID = nil
     EXITED = nil
     RE_FIND = opts.evil and function(s) return hit(s) end or opts.hit and true or nil
@@ -232,9 +242,21 @@ local function request(opts)
     return {
         blocked = blocked,
         status = ngx.status,
+        retry = ngx.header["Retry-After"],
+        banned = ngx.shared.openlitewaf:get("b:" .. (opts.ip or "1.2.3.4")) ~= nil,
         body = SAID,
         dict = ngx.shared.openlitewaf,
     }
+end
+
+-- 让某个 IP 达到封禁阈值：v1.3.0 起单次特征命中只 403，窗口内累计 sig_strikes 次才封 IP
+local function ban_ip(ip, wafref)
+    local strikes = (wafref or waf).CONFIG.sig_strikes
+    local last
+    for _ = 1, strikes do
+        last = request({ uri = "/?id=1%20UNION%20SELECT%20a", hit = true, ip = ip })
+    end
+    return last
 end
 
 -- 干净环境（新 dict + 新模块副本），用于体检查/日志/封禁槽位等独立场景
@@ -295,35 +317,44 @@ ok(waf._rules_compiled() ~= nil, "首个非豁免请求触发规则惰性编译�
 r = request({ uri = "/security", hit = true })
 ok(not r.blocked, "统计页跳过特征匹配")
 
--- T5 CC：第 limit+1 次触发封禁（窗口内）
+-- T5 CC：第 limit+1 次触发节流（窗口内），返回 429 且不封 IP
 local d
 for i = 1, 241 do
     d = request({ uri = "/v1/log", ip = "5.6.7.8" })
 end
-ok(d.blocked and d.status == 403, "CC 超限返回 403")
+ok(d.blocked and d.status == 429, "CC 超限返回 429")
+ok(d.retry ~= nil, "CC 响应带 Retry-After")
 ok(d.body and d.body:find("频率过高", 1, true) ~= nil, "CC 拦截返回警告页")
 ok(counter(d.dict, "cc") == 1, "CC 触发计入 cc 计数")
+ok(not d.banned, "CC 不写封禁名单（对 CGNAT 出口不该整片封）")
 
--- T6 封禁期间即使低频也拦截（不计类目，只计 blocked）
+-- T6 CC 只节流不封禁：同一窗口内继续 429，跨窗口自动恢复
 r = request({ uri = "/v1/log", ip = "5.6.7.8" })
-ok(r.blocked, "封禁期内持续拦截")
-ok(counter(d.dict, "cc") == 1, "封禁期不再重复计类目")
+ok(r.blocked and r.status == 429, "同一窗口内持续 429")
+NOW = NOW + 11
+r = request({ uri = "/v1/log", ip = "5.6.7.8" })
+ok(not r.blocked, "新窗口内 CC 自动恢复")
 
 -- T7 窗口滑动：新窗口恢复计数（换未封禁 IP）
 NOW = NOW + 11
 r = request({ uri = "/v1/log", ip = "9.9.9.9" })
 ok(not r.blocked, "新窗口内正常放行")
 
--- T8 特征命中：封禁 + 类目计数
+-- T8 特征命中：单次只 403，不封 IP
 NOW = NOW + 1
 r = request({ uri = "/?id=1%20UNION%20SELECT%20a", ip = "7.7.7.7", hit = true })
 ok(r.blocked and r.status == 403, "特征命中返回 403")
 ok(counter(r.dict, "sqli") == 1, "特征命中计入类目")
+ok(not r.banned, "单次命中不封 IP（未达 sig_strikes 阈值）")
 
--- T9 特征封禁后：规则不再命中也拦截
+-- T9 窗口内累计达阈值才封禁；封禁期内即使不命中特征也拦截
+NOW = NOW + 1
+request({ uri = "/?id=1%20UNION%20SELECT%20a", ip = "7.7.7.7", hit = true })
+r = request({ uri = "/?id=1%20UNION%20SELECT%20a", ip = "7.7.7.7", hit = true })
+ok(r.banned, "累计三次命中后封禁 IP")
 NOW = NOW + 1
 r = request({ uri = "/v1/log", ip = "7.7.7.7", hit = false })
-ok(r.blocked, "特征封禁期内持续拦截")
+ok(r.blocked and r.status == 403, "特征封禁期内持续拦截")
 
 -- T10 其它 IP 不受影响
 r = request({ uri = "/v1/log", ip = "8.8.8.8" })
@@ -357,13 +388,11 @@ ok(not r.blocked, "/security/stats 精确匹配跳过特征")
 r = request({ uri = "/security/logs", hit = true, ip = "12.1.1.3" })
 ok(not r.blocked, "/security/logs 精确匹配跳过特征")
 
--- T15 封禁 TTL 到期自动解封
+-- T15 封禁 TTL 到期自动解封（特征封禁，sig_ban=600）
 local banip = "13.1.1.1"
-for _ = 1, 241 do
-    r = request({ uri = "/v1/log", ip = banip })
-end
-ok(r.blocked, "T15 CC 触发封禁")
-NOW = NOW + 601  -- 超过 cc.ban=600 秒
+r = ban_ip(banip)
+ok(r.banned, "T15 累计命中触发封禁")
+NOW = NOW + 601
 r = request({ uri = "/v1/log", ip = banip })
 ok(not r.blocked, "封禁到期后自动解封")
 
@@ -414,6 +443,27 @@ do
         hit = true, ip = "14.2.1.4",
     })
     ok(r.blocked, "raw 路径上的恶意特征仍被拦截（S2 防御）")
+
+    -- v1.3.0：前端遥测与管理端同样属"任意用户文本摄入"，body 不查特征
+    r = request({
+        uri = "/v1/telemetry/report", method = "POST", clen = "80",
+        body = 'EVIL {"items":[{"endpoint":"https://logshare.cn/v1/raw/qKSA1QU/main.log"}]}',
+        evil = true, ip = "14.2.1.5",
+    })
+    ok(not r.blocked, "遥测端点 body 豁免（本次线上误封回归）")
+
+    r = request({
+        uri = "/v1/admin/rag/docs/save", method = "POST", clen = "60",
+        body = 'EVIL {"content":"# 排障\\n执行 `whoami` 或 curl https://example.com 并读 ../config.yml"}',
+        evil = true, ip = "14.2.1.6",
+    })
+    ok(not r.blocked, "管理端 body 豁免（知识库正文含反引号与 curl）")
+
+    -- 豁免只作用于 body：这些端点 URI/UA 上的攻击特征仍拦
+    r = request({ uri = "/v1/telemetry/report?x=EVIL", evil = true, ip = "14.2.1.7" })
+    ok(r.blocked, "body 豁免不影响 URI 检查")
+    r = request({ uri = "/v1/admin/logs", ua = "EVIL/1.0", evil = true, ip = "14.2.1.8" })
+    ok(r.blocked, "body 豁免不影响 UA 检查")
 end
 
 -- T18 body 尺寸超限跳过检查
@@ -440,6 +490,21 @@ do
         and js:find("192.168.*.*", 1, true) ~= nil, "日志 IP 已脱敏")
     ok(js and js:find('"cat"', 1, true) ~= nil and js:find('"t"', 1, true) ~= nil,
         "日志条目含类目与时间字段")
+    ok(js and js:find('"rule"', 1, true) ~= nil and js:find('"via":"uri"', 1, true) ~= nil,
+        "日志条目含命中规则序号与匹配对象")
+end
+
+-- T19b 命中对象与规则序号可归因；请求体内容绝不进日志与公开页
+do
+    local w = fresh()
+    request({
+        uri = "/api/submit", method = "POST", clen = "60",
+        body = 'EVIL {"secret":"TOP-SECRET-BODY"}', evil = true, ip = "19.9.9.9",
+    })
+    js = stats_json(w, "/security/logs", "1")
+    ok(js and js:find('"via":"body"', 1, true) ~= nil, "body 命中记为 via=body")
+    ok(js and js:find("TOP-SECRET-BODY", 1, true) == nil, "请求体内容不写入攻击日志")
+    ok(js and js:find("EVIL", 1, true) == nil, "命中片段不写入攻击日志")
 end
 
 -- T20 日志容量 500 与分页（每页 50）
@@ -469,14 +534,16 @@ end
 -- T21 封禁槽位：活跃封禁数近似与到期衰减
 do
     local w = fresh()
-    -- 特征封禁 1 个 IP
-    request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.1" })
+    -- 特征封禁 1 个 IP（累计到 sig_strikes 才封）
+    ban_ip("15.1.1.1")
     js = stats_json(w, "/security/stats")
     ok(js and js:find('"banned_active":1', 1, true) ~= nil, "活跃封禁数为 1")
     ok(js and js:find('"banned_total"', 1, true) == nil, "封禁发生不产生累计封禁次数指标")
+    ok(js and js:find('"ban_reasons"', 1, true) ~= nil
+        and js:find('"sqli#', 1, true) ~= nil, "stats 输出封禁原因分布（类目#规则序号）")
     -- 再封 2 个
-    request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.2" })
-    request({ uri = "/?id=1 UNION", hit = true, ip = "15.1.1.3" })
+    ban_ip("15.1.1.2")
+    ban_ip("15.1.1.3")
     js = stats_json(w, "/security/stats")
     ok(js and js:find('"banned_active":3', 1, true) ~= nil, "活跃封禁数累计到 3")
     -- 封禁到期（sig_ban=600）后槽位衰减
@@ -528,7 +595,7 @@ do
     os.remove(dir .. "/snapshot.json")
     local w1 = fresh()
     w1.CONFIG.data_dir = dir
-    request({ uri = "/?id=1 UNION", hit = true, ip = "30.1.1.1" })
+    ban_ip("30.1.1.1")
     local seq_before = ngx.shared.openlitewaf:get("log_seq")
     ok(w1._save(ngx.shared.openlitewaf) == true, "T25 快照写入成功")
     -- 新 dict + 新模块：模拟进程重启后的 init 恢复
@@ -537,14 +604,15 @@ do
     w2.CONFIG.data_dir = dir
     w2.init()
     local d2 = ngx.shared.openlitewaf
-    ok(counter(d2, "total") == 1, "T25 计数器恢复")
-    ok(counter(d2, "sqli") == 1, "T25 类目计数恢复")
+    ok(counter(d2, "total") == 3, "T25 计数器恢复（三次命中）")
+    ok(counter(d2, "sqli") == 3, "T25 类目计数恢复")
     ok(d2:get("b:30.1.1.1") ~= nil, "T25 封禁名单恢复")
+    ok(d2:get("bx:0") == "sqli#1", "T25 封禁原因随快照恢复")
     ok(d2:get("log_seq") == seq_before, "T25 攻击日志序列恢复")
     -- 恢复后的封禁仍然生效（封禁期内拦截、不重复计类目）
     local r25 = request({ uri = "/v1/log", ip = "30.1.1.1" })
     ok(r25.blocked, "T25 恢复的封禁仍拦截")
-    ok(counter(d2, "sqli") == 1, "T25 恢复后封禁期不重复计类目")
+    ok(counter(d2, "sqli") == 3, "T25 恢复后封禁期不重复计类目")
     os.remove(dir .. "/snapshot.json")
 end
 
@@ -555,6 +623,130 @@ do
     ok(w._mask_ip("fe80::1") == "fe80:0:0::*", "T26 IPv6 压缩 fe80::1 展开脱敏")
     ok(w._mask_ip("2001:db8::1") == "2001:db8:0::*", "T26 IPv6 压缩 2001:db8::1 展开脱敏")
     ok(w._mask_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == "2001:0db8:85a3::*", "T26 IPv6 完整地址脱敏")
+end
+
+-- T27 规则作用域掩码：路径形态的探测特征不得参与 body/UA 匹配
+do
+    local w = fresh()   -- 必须在任何请求之前取掩码（掩码按模块实例惰性构建）
+    local ALL, PATH, UA, URI, BODY = 15, 2, 4, 1, 8
+    local function idx_of(needle)
+        for i, rule in ipairs(w.RULES) do
+            if type(rule[2]) == "string" and rule[2]:find(needle, 1, true) then return i end
+        end
+        return 0
+    end
+    -- 先塞一条作用域拼错的规则，再一次性构建掩码表（覆盖"退化全对象"分支）
+    w.RULES[#w.RULES + 1] = { "sqli", [[zzz]], "bogus" }
+    local bogus = #w.RULES
+
+    local ext = idx_of([[\.(sql|bak]])
+    ok(ext > 0, "可定位敏感文件扩展名规则")
+    ok(w._rule_scope_mask(ext) == PATH, "扩展名探测规则只作用于请求路径（不含 query）")
+    ok(w._rule_scope_mask(idx_of([[union\s+]])) == ALL, "未声明作用域的规则仍作用于全部匹配对象")
+    ok(w._rule_scope_mask(idx_of([[sqlmap|nikto]])) == UA + URI, "扫描器 UA 规则作用于 UA 与 URI，不扫 body")
+    local fname = idx_of([[filename=]])
+    ok(fname > 0 and w._rule_scope_mask(fname) == BODY, "上传文件名规则只作用于请求体")
+    ok(w._rule_scope_mask(idx_of([[/(\.env|\.git]])) == URI, "dotfile 探测规则只作用于 URI 侧，不扫 body/UA")
+    ok(w._rule_scope_mask(bogus) == ALL, "非法作用域退化为全对象")
+end
+
+-- T28 运维端点：令牌鉴权、解封清槽与立即落盘、被误封者可用
+do
+    local dir = "/data/data/com.termux/files/usr/tmp/wafdbg/adm"
+    os.execute("mkdir -p " .. dir)
+    os.remove(dir .. "/snapshot.json")
+    local w = fresh()
+    w.CONFIG.data_dir = dir
+
+    local function admin_call(opts)
+        ngx.var.uri = opts.uri or "/security/unban"
+        ngx.var.request_uri = ngx.var.uri
+        ngx.var.remote_addr = opts.ip or "127.0.0.1"
+        ngx.var.http_user_agent = "curl/8.5.0"
+        ngx.var.http_x_openlitewaf_token = opts.token
+        ngx.var.arg_ip = opts.ip_param
+        ngx.status = nil
+        SAID = nil
+        EXITED = nil
+        local okrun = pcall(function() w.admin() end)
+        return { said = SAID, exit = EXITED, status = ngx.status, ran = okrun }
+    end
+
+    w.CONFIG.admin_token = ""
+    local a = admin_call({ token = "0123456789abcdef", ip_param = "1.2.3.4" })
+    ok(a.exit == 404 and a.said == nil, "未配置令牌时端点 404（fail-closed）")
+    w.CONFIG.admin_token = "0123456789abcdef"
+    a = admin_call({ token = "0123456789abcde", ip_param = "1.2.3.4" })
+    ok(a.exit == 404, "令牌不匹配时 404，不区分不存在与无权限")
+
+    -- 先造一次真实封禁，再解封
+    w.CONFIG.admin_token = nil
+    local victim = "31.1.1.1"
+    ban_ip(victim)
+    local d = ngx.shared.openlitewaf
+    ok(d:get("b:" .. victim) ~= nil, "解封前该 IP 处于封禁状态")
+    w.CONFIG.admin_token = "0123456789abcdef"
+    a = admin_call({ token = "0123456789abcdef", ip_param = victim })
+    ok(a.said and a.said:find('"ok":true', 1, true) ~= nil, "解封调用成功")
+    ok(d:get("b:" .. victim) == nil, "解封删除封禁名单键")
+    ok(d:get("s:" .. victim) == nil, "解封同时清零 strike 计数")
+    ok(d:get("br:0") == nil and d:get("bs:0") == nil and d:get("bx:0") == nil,
+        "解封清理封禁槽位（否则快照会在 60 秒内把它写回）")
+    local f = io.open(dir .. "/snapshot.json", "rb")
+    local snap = f and f:read("*a") or ""
+    if f then f:close() end
+    ok(snap ~= "" and snap:find(victim, 1, true) == nil, "解封后立即落盘，restart 不再复活封禁")
+
+    -- /security/bans 列出现封禁及其原因（运维排查入口）
+    ban_ip("33.1.1.1")
+    a = admin_call({ uri = "/security/bans", token = "0123456789abcdef" })
+    ok(a.said and a.said:find("33.1.1.1", 1, true) ~= nil
+        and a.said:find("sqli#1", 1, true) ~= nil, "/security/bans 输出封禁 IP 与封禁原因")
+
+    -- 非法 ip 参数：拒且不动任何键（拼错的值会变成 shared dict 的任意键名）
+    d:set("b:9.9.9.9", 1, 600)
+    a = admin_call({ token = "0123456789abcdef", ip_param = "total" })
+    ok(a.status == 400 and a.said:find('"ok":false', 1, true) ~= nil, "非 IP 字面量的 ip 参数返回 400")
+    a = admin_call({ token = "0123456789abcdef", ip_param = "9.9.9.9;del" })
+    ok(a.status == 400, "带分隔符注入的 ip 参数被拒")
+    ok(d:get("b:9.9.9.9") ~= nil, "被拒的调用不动任何封禁键")
+
+    -- 被误封的管理者仍能访问运维端点自身；前缀变体不能绕过封禁检查
+    local adminip = "32.1.1.1"
+    ban_ip(adminip)
+    r = request({ uri = "/v1/log", ip = adminip })
+    ok(r.blocked, "封禁期内普通端点仍被拦")
+    r = request({ uri = "/security/unban", ip = adminip })
+    ok(not r.blocked, "封禁期内可访问 /security/unban 自助解封")
+    r = request({ uri = "/security/unbanish", ip = adminip, hit = true })
+    ok(r.blocked, "/security/unban 前缀变体不得绕过封禁名单检查")
+    r = request({ uri = "/security/unban", ip = adminip, hit = true })
+    ok(not r.blocked, "运维端点自身跳过特征匹配（精确 URI）")
+    os.remove(dir .. "/snapshot.json")
+end
+
+-- T29 旧格式快照（无封禁原因字段）必须能恢复且不报错
+do
+    local dir = "/data/data/com.termux/files/usr/tmp/wafdbg/oldsnap"
+    os.execute("mkdir -p " .. dir)
+    local f = io.open(dir .. "/snapshot.json", "wb")
+    if f then
+        f:write('{"version":"1.2.0","counters":{"total":7,"sqli":2},'
+            .. '"bans":[{"slot":3,"exp":' .. tostring(NOW + 500) .. ',"ip":"40.1.1.1"}],'
+            .. '"trends":[],"logs":[],"ban_seq":4,"log_seq":2}')
+        f:close()
+    end
+    ngx.shared.openlitewaf = newdict()
+    local w = dofile(LUA_PATH)
+    w.CONFIG.data_dir = dir
+    w.init()
+    local d = ngx.shared.openlitewaf
+    ok(d:get("b:40.1.1.1") ~= nil, "旧快照的封禁仍能恢复")
+    ok(counter(d, "total") == 7, "旧快照的计数仍能恢复")
+    js = stats_json(w, "/security/stats")
+    ok(js and js:find('"banned_active":1', 1, true) ~= nil, "旧快照恢复后活跃封禁数正确")
+    ok(js and js:find('"?"', 1, true) ~= nil, "缺原因的历史封禁归入 ? 而不报错")
+    os.remove(dir .. "/snapshot.json")
 end
 
 print(fail == 0 and "全部通过" or (fail .. " 项失败"))

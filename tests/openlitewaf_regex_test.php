@@ -10,40 +10,76 @@ if (!preg_match('/-- RULES-BEGIN(.*?)-- RULES-END/s', $lua, $m)) {
 }
 // 支持可选等号长括号 [[...]] / [==[...]==]（规则含 ]] 字符时按 README 规范
 // 使用等号长括号书写，如 uname 的字符类规则），否则这类规则会被静默漏解析、
-// 脱离回归测试
-if (!preg_match_all('/\{\s*"([a-z]+)",\s*\[(=*)\[(.*?)\]\2\]\s*\}/s', $m[1], $raw, PREG_SET_ORDER)) {
+// 脱离回归测试。第三元素为可选的匹配对象作用域（uri / ua / body，空格分隔），
+// 省略即作用于全部匹配对象。
+if (!preg_match_all('/\{\s*"([a-z]+)",\s*\[(=*)\[(.*?)\]\2\](?:\s*,\s*"([a-z ]+)")?\s*\}/s', $m[1], $raw, PREG_SET_ORDER)) {
     exit("未解析到任何规则\n");
 }
 $rules = [];
 foreach ($raw as $r) {
-    // 组 1 = 类目，组 2 = 长括号等号，组 3 = 正则体
-    $rules[] = ['cat' => $r[1], 're' => $r[3]];
+    // 组 1 = 类目，组 2 = 长括号等号，组 3 = 正则体，组 4 = 作用域（可省略）
+    $rules[] = ['cat' => $r[1], 're' => $r[3], 'scope' => $r[4] ?? ''];
 }
 echo '已加载规则数：' . count($rules) . "\n";
 
-// 与 openlitewaf.lua 一致的匹配语义：按规则表顺序，命中即停；
-// URI 请求先查原始 request_uri（编码形态），未命中再查完整解码形态（与生产双 subject 一致）
-function first_hit(array $rules, string $subject): ?string {
+// 漏条守门：解析器一旦跟不上规则表写法（新增括号形态、多行书写等），
+// 缺失的规则会静默脱离本回归测试 —— 这正是历史上 [==[ ]==] 长括号规则踩过的坑。
+$declared = preg_match_all('/^\s*\{\s*"/m', $m[1]);
+if (count($rules) !== $declared) {
+    exit("规则解析漏条：块内声明 {$declared} 条，实际解析 " . count($rules) . " 条\n");
+}
+foreach ($rules as $i => $rule) {
+    foreach (array_filter(preg_split('/ +/', $rule['scope']) ?: [], 'strlen') as $tok) {
+        if (!in_array($tok, ['uri', 'path', 'ua', 'body'], true)) {
+            exit('规则 #' . ($i + 1) . " 作用域非法：{$tok}（仅允许 uri/path/ua/body）\n");
+        }
+    }
+}
+
+// 与 openlitewaf.lua 一致的匹配语义：按匹配对象外层、规则表内层的顺序，命中即停；
+// 规则声明的作用域不含当前匹配对象时跳过该规则。生产为 URI 侧提供两个匹配对象——
+// 原始/解码 request_uri（kind=uri，含 query）与规范化路径（kind=path，不含 query），
+// 这里用截断 '?' 后的路径段近似规范化路径。
+function kind_of(string $subject): string
+{
+    return str_starts_with($subject, '/') ? 'uri' : 'ua';
+}
+
+function path_of(string $subject): string
+{
+    $q = strpos($subject, '?');
+    return $q === false ? $subject : substr($subject, 0, $q);
+}
+
+function applies(string $scope, string $kind): bool
+{
+    return $scope === '' || in_array($kind, preg_split('/ +/', $scope) ?: [], true);
+}
+
+function first_hit(array $rules, string $subject, string $kind): ?string {
     foreach ($rules as $rule) {
-        if (@preg_match('~' . $rule['re'] . '~i', $subject)) {
+        if (applies($rule['scope'], $kind) && @preg_match('~' . $rule['re'] . '~i', $subject)) {
             return $rule['cat'];
         }
     }
     return null;
 }
 
-function check(array $rules, string $subject): ?string {
-    $hit = first_hit($rules, $subject);
-    if ($hit === null && str_starts_with($subject, '/')) {
-        $decoded = urldecode($subject);
-        if ($decoded !== $subject) {
-            $hit = first_hit($rules, $decoded);
-        }
+function check(array $rules, string $subject, string $kind): ?string {
+    if ($kind !== 'uri') {
+        return first_hit($rules, $subject, $kind);
     }
-    return $hit;
+    // 编码形态先查，再查解码形态（与生产的双 subject 一致）
+    foreach (array_unique([$subject, urldecode($subject)]) as $form) {
+        $hit = first_hit($rules, $form, 'uri');
+        if ($hit !== null) return $hit;
+        $hit = first_hit($rules, path_of($form), 'path');
+        if ($hit !== null) return $hit;
+    }
+    return null;
 }
 
-// [subject, 期望类目或 null]
+// [subject, 期望类目或 null, 匹配对象?]（第三元素省略时按 kind_of 推断：/ 开头为 uri，否则为 ua）
 $cases = [
     // ── 应拦截 ──
     ['/v1/log?id=1 UNION SELECT username FROM users', 'sqli'],
@@ -127,13 +163,47 @@ $cases = [
     // 统计页自身两个精确 URI 不应被规则误伤
     ['/security', null],
     ['/security/stats', null],
+    // ── v1.3.0 匹配对象作用域：路径形态的探测特征不再作用于请求体与 UA ──
+    // 请求体里出现文件名与路径串属正常业务（日志分享、知识库正文、前端遥测）
+    ['{"items":[{"type":"api","endpoint":"https://logshare.cn/v1/raw/qKSA1QU/main.log","status":200}]}', null, 'body'],
+    ['{"type":"error","message":"cannot read config.yml","stack":"at /assets/latest.log reader"}', null, 'body'],
+    ['知识库正文提到 /.git/config 与 phpmyadmin 与 /cgi-bin/ 与 web.config', null, 'body'],
+    ['{"name":"serverstatus snapshot","file":"sitemap.xml","note":"druid nacos jenkins cgi"}', null, 'body'],
+    // 但 body 里的真实 payload 特征仍必须命中（作用域收窄不等于关闭 body 检查）
+    ['{"q":"1 union select user,password from users"}', 'sqli', 'body'],
+    ['{"html":"<script>document.cookie</script>"}', 'xss', 'body'],
+    ['{"path":"../../../../etc/passwd"}', 'traversal', 'body'],
+    ['{"cmd":"1;cat /etc/hosts"}', 'traversal', 'body'],
+    // multipart 上传文件名带可执行后缀（只有 body 作用域的规则能看到）
+    ['Content-Disposition: form-data; name="file"; filename="shell.php"', 'probe', 'body'],
+    ['Content-Disposition: form-data; name="file"; filename="up.phtml"', 'probe', 'body'],
+    // 正常附件名与文档名不得误伤
+    ['Content-Disposition: form-data; name="file"; filename="latest.log"', null, 'body'],
+    ['Content-Disposition: form-data; name="file"; filename="notes.md"', null, 'body'],
+    // 扫描器 UA 规则不看 body
+    ['{"ua":"Mozilla/5.0 (compatible; hydra-client/1.0)"}', null, 'body'],
+    // query 里的文件名不再判探测；请求路径里的敏感文件仍然要拦
+    ['/v1/log?file=latest.log', null],
+    ['/v1/admin/rag/docs/content?path=config.json', null],
+    ['/sitemap.xml', null],
+    ['/robots.txt', null],
+    ['/v1/telemetry/report', null],
+    ['/latest.log', 'probe'],
+    ['/web.config', 'probe'],
+    ['/appsettings.json', 'probe'],
+    ['/.git-credentials', 'probe'],
+    ['/db.backup.sql', 'probe'],
+    ['/?u=%2e%2e%2f%2e%2e%2fetc%2fshadow', 'traversal'],
 ];
 
-foreach ($cases as [$subject, $expected]) {
-    $got = check($rules, $subject);
+foreach ($cases as $case) {
+    $subject = $case[0];
+    $expected = $case[1];
+    $kind = $case[2] ?? kind_of($subject);
+    $got = check($rules, $subject, $kind);
     if ($got !== $expected) {
         $fail++;
-        echo "FAIL: {$subject}\n  期望: " . var_export($expected, true) . "  实际: " . var_export($got, true) . "\n";
+        echo "FAIL [{$kind}]: {$subject}\n  期望: " . var_export($expected, true) . "  实际: " . var_export($got, true) . "\n";
     }
 }
 
